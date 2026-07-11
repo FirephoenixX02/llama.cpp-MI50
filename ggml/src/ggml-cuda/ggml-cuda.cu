@@ -122,13 +122,11 @@ void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
 
-    int current_device;
-    CUDA_CHECK(cudaGetDevice(&current_device));
-
-    if (physical_device == current_device) {
-        return;
-    }
-
+    // Fix (llama.cpp #21140 / #18313): the skip-if-already-current optimization
+    // could skip cudaSetDevice on ROCm multi-GPU when cudaGetDevice returned a
+    // stale value on an uninitialized thread, causing async memcpys to run on
+    // device -1 (illegal memory access during recurrent-state / prompt-cache
+    // restore). cudaSetDevice on the current device is a near-no-op; always call.
     CUDA_CHECK(cudaSetDevice(physical_device));
 }
 
@@ -2468,6 +2466,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device); // #18313: set device before async copy (multi-GPU)
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
@@ -2477,6 +2476,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device); // #18313: set device before async copy (multi-GPU)
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
@@ -2487,6 +2487,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device); // #18313: set device before async copy (multi-GPU)
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2498,6 +2499,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    ggml_cuda_set_device(cuda_ctx->device); // #18313: set device before async copy (multi-GPU)
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
