@@ -230,6 +230,13 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 }
 
 static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
+    if (GGML_CUDA_CC_IS_GCN(cc)) {
+        // Vega20 (gfx906): W64 dp4a, 64KB LDS/CU, clamp to 1 stage + occupancy 1 (vllm-gfx906)
+        fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        cfg.nstages_target = std::min(cfg.nstages_target, 1);
+        cfg.occupancy = 1;
+        return cfg;
+    }
     if (ampere_mma_available(cc)) {
         return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
     }
@@ -247,7 +254,16 @@ static __host__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, c
 }
 
 static constexpr __device__ fattn_mma_config ggml_cuda_fattn_mma_get_config(const int DKQ, const int DV, const int ncols) {
-#if defined(AMPERE_MMA_AVAILABLE)
+#if defined(GCN) || defined(__gfx906__)
+    // Vega20: clamp stages, occupancy 1 for 64KB LDS stability
+    {
+        fattn_mma_config cfg = ggml_cuda_fattn_mma_get_config_rdna(DKQ, DV, ncols);
+        cfg.nstages_target = 1;
+        if (cfg.nstages_target > 1) cfg.nstages_target = 1;
+        cfg.occupancy = 1;
+        return cfg;
+    }
+#elif defined(AMPERE_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
 #elif defined(TURING_MMA_AVAILABLE)
     return ggml_cuda_fattn_mma_get_config_turing(DKQ, DV, ncols);
