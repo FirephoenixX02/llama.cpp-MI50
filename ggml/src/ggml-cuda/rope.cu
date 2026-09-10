@@ -31,10 +31,20 @@ static __device__ void rope_yarn(
         theta = theta_interp * (1 - ramp_mix) + theta_extrap * ramp_mix;
 
         // Get n-d magnitude scaling corrected for interpolation
+#if defined(GGML_USE_HIP) && defined(GCN)
+        mscale *= 1.0f + 0.1f * __logf(1.0f / freq_scale);
+#else
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+#endif
     }
+#if defined(GGML_USE_HIP) && defined(GCN)
+    __sincosf(theta, &sin_theta, &cos_theta);
+    cos_theta *= mscale;
+    sin_theta *= mscale;
+#else
     cos_theta = cosf(theta) * mscale;
     sin_theta = sinf(theta) * mscale;
+#endif
     if (!forward) {
         sin_theta *= -1.0f;
     }
