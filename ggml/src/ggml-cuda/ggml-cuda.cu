@@ -73,6 +73,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/gfx906-mi50-opts.cuh"
 #include "ggml.h"
 
 #include <algorithm>

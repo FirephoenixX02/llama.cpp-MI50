@@ -298,24 +298,35 @@ local gfx906/mi50-optimization   ────────── 311d4211b ──
 
 ---
 
-## Turbo High-Value Ports (2026-09-10, uncommitted)
+## Turbo High-Value Ports (2026-09-10, `6ada0839a`)
 
-Ported from `arte-fact/llamacpp-gfx-906-turbo` (`gfx906/` 29-file W64 kernels). Build verified via `./build-llamacpp-rocm.sh` (ROCm 7.2.4, `gfx906`, `GGML_CUDA_REPACK`).
+Ported from `arte-fact/llamacpp-gfx-906-turbo` (`gfx906/` 29-file W64 kernels). Build verified via `./build-llamacpp-rocm.sh` (ROCm 7.2.4, `gfx906`, `GGML_CUDA_REPACK`). Bench on `Qwen3.5-9B UD-Q4_K_XL` `pp512/tg128` neutral within variance (pp `647→646`, tg `70.7→71.4`), benefits MoE/Q4_0/Q8_0.
 
 | # | Port | File | Change | Status |
 |---|------|------|--------|--------|
-| 20 | `add-id` vectorized | `ggml/src/ggml-cuda/add-id.cu:3` | `float4` coalesced path + contiguous fast path; `ne0%4==0` aligned -> 4x fewer global loads | Built, pending commit |
-| 21 | `rope` GCN `__sincosf` | `ggml/src/ggml-cuda/rope.cu:20` | `rope_yarn` uses `__sincosf` + `__logf` on `GCN` (vs `cosf+sinf+logf`); saves 1 transcendental per `n_dims/2` lanes | Built, pending commit |
-| 22 | `vecdotq` fast `b1/b2` + MXFP4 LUT | `ggml/src/ggml-cuda/vecdotq.cuh:7` | `memcpy` `flat_load` for `b1/b2`, `__builtin_amdgcn_perm` 8-entry MXFP4 `v_perm` (0-12), `GGML_GCN_VEC_DOT_MXFP4_Q8_1` macro in `vec_dot_mxfp4_q8_1` + `gfx906_get_int_b2_fast` in `vec_dot_q8_0_q8_1` | Built, pending commit |
-| 23 | `quantize` DPP | — | **Deferred**: `quantize_q8_1` already hits `common.cuh:452` DPP `warp_reduce_max/sum`; turbo's `quantize_mmq_q8_1` ultra-fused 4-val/thread DPP asm (`quantize.cu:216`) is high-risk asm, low benefit vs existing path. Keep for future if `quantize_mmq` profiling shows hot. |
+| 20 | `add-id` vectorized | `ggml/src/ggml-cuda/add-id.cu:3` | `float4` coalesced + contiguous fast path; `ne0%4==0` aligned -> 4x fewer loads | `6ada0839a` |
+| 21 | `rope` GCN `__sincosf` | `ggml/src/ggml-cuda/rope.cu:20` | `rope_yarn` `__sincosf`+`__logf` on `GCN` | `6ada0839a` |
+| 22 | `vecdotq` fast `b1/b2` + MXFP4 LUT | `ggml/src/ggml-cuda/vecdotq.cuh:7` | `memcpy` `flat_load`, `v_perm` MXFP4, `GGML_GCN_VEC_DOT_MXFP4_Q8_1` | `6ada0839a` |
+| 23 | `quantize` DPP | — | **Deferred**: `quantize_q8_1` already `common.cuh:452` DPP; turbo `quantize_mmq_q8_1` `4-val/thread` asm high-risk, low gain. | — |
 
-`git diff --stat HEAD`: `add-id.cu 117 +-`, `rope.cu 10 +`, `vecdotq.cuh 59 +` (175 ins). Isolated to GCN guards (`defined(GCN)` / `__gfx906__`), no CDNA/RDNA/NV impact when `GGML_CUDA_REPACK=0`; gated FATTN/MMQ unchanged.
+Remaining turbo candidates (deferred):
+- `mmvq warp-coop` (`gfx906/matmul/mmvq-q4_0/q4_1/q8_0.cuh:11` half-warp) — `Q4_0/Q4_1` `REPACK=0`
+- `mmq vectorized + prefetch` (`mmq.cuh:11`, `mmq-prefetch.cuh:11`)
+- `sgemm/mmf` (`gfx906/matmul/sgemm.cuh:16`, `mmf.cuh:17`)
+- `fattn-q8` tile (`gfx906/attention/fattn-q8.cuh:1`)
 
-Remaining turbo candidates (deferred, see `NEXT_OPTIMIZATIONS.md`):
-- `mmvq warp-coop` (`gfx906/matmul/mmvq-q4_0/q4_1/q8_0.cuh:11` half-warp 32t/row) — benefits canonical `Q4_0/Q4_1` decode when `REPACK=0`; conflicts with repacked path, needs `!repack` gate.
-- `mmq vectorized + prefetch` (`mmq.cuh:11`, `mmq-prefetch.cuh:11` `global_load_dword` Y/X L2 prefetch) — only for upstream MMQ, not repacked MMQ.
-- `sgemm/mmf` custom `F32 32x32x64` / `F16 32x64x64` (`gfx906/matmul/sgemm.cuh:16`, `mmf.cuh:17`) — standalone, 2x small GEMM, no deps; candidate for next port.
-- `fattn-q8` tile (`gfx906/attention/fattn-q8.cuh:1` 8 `DKQ/DV` instances) — heavy, only for `Q8_0 KV`.
+## mi50grad Single-GPU Ports (2026-09-10, staged)
+
+Source: `mi50grad/` `gfx906` standalone `HIP` stack (`4×MI50` `27B GPTQ-Int4` `~54 tok/s` `RESEARCH.md:1`, `FUTURE_RESEARCH.md:1`). Multi-GPU (`kernel P2P AR`, `deferred AR`, `fused GEMV+AR+RMSNorm`) excluded per request — only single-GPU kernels ported.
+
+| # | Port | File | Change | Status |
+|---|------|------|--------|--------|
+| 24 | `RMSNorm` vectorized | `ggml/src/ggml-cuda/norm.cu:77` `rms_norm_f32_gfx906<256/1024>` | `float4` 4× per thread (`tid*4` `float4` load), `block_reduce SUM` DPP `common.cuh:452`, `rsqrtf` broadcast, `float4` store. Gate `GCN && ncols%4==0` in `rms_norm_f32_cuda`. `copied from elementwise_v2.hip:62` `rmsnorm_v2` half2→F32. Bench `pp512 646.9±5.1 tg128 71.43±0.25` neutral. | Built `build-llamacpp-rocm.sh` ok |
+| 25 | `Dual FFN` 4× | `ggml/src/ggml-cuda/gfx906-mi50-opts.cuh:20` `mi50_gemv_dual_fused_4x` | `4×` register blocking `acc_gate0/1 acc_up0/1` dual `dequant_dot8_fp32:22` (GPTQ `ubfe`+`FP32` `scale/zero`), `atomicAdd` persistent `C_gate/up` + `done` barrier, `silu` `__expf`. Direct copy `gemv_int4_dual.hip:157` `gemv_int4_dual_fused` `kg+=4`. Compiled gated `GCN`, not yet dispatched (needs `Q4_K` repack `gate+up` wiring). | Compiled, gated |
+| 26 | `GEMV v8` 4× | `gfx906-mi50-opts.cuh:80` `mi50_gemv_v8_coop<4/8/16>` | `4×` words/iter `acc0/1`, `FP32-only` `dequant_dot8_fp32` (vs `fdot2` FP16), `TPC_PER_WF` `DPP` `__shfl_down(COLS_PER_WG)` + `LDS 4*COLS_PER_WG`. Copy `gemv_int4_v8.hip:51` `gemv_int4_v8_cooperative`. `t16/t8/t4` `256` threads. | Compiled, gated |
+| 27 | `FlashAttn 256 v3` | `gfx906-mi50-opts.cuh:140` `mi50_flash_attn_256_v3_prefill` | `BLOCK_M=16 BLOCK_N=16`, `4 WF ×4 Q rows ×16 dims` `qreg[16]`, `8×fdot2` `v_dot2_f32_f16` per score, `16-way shfl_down 8/4/2/1` + `shfl` broadcast, `LDS 16KB` (`k_lds/v_lds` `8K+8K`) `float4` loads, `online softmax` `expf`. Copy `flash_attn_256_v3.hip:188`. Single-GPU prefill only. | Compiled, gated |
+
+`gfx906-mi50-opts.cuh` is `GCN`-only (`#if defined(GGML_USE_HIP) && defined(GCN)`) so no `CDNA/RDNA/NV` impact; included via `ggml-cuda.cu:73` `#include "gfx906-mi50-opts.cuh"`. Kernels are `__global__` but not yet auto-dispatched — activate via `GGML_CUDA_MI50_DUAL_V8` / `FLASH_V3` env or explicit `cc==906 && head_dim==256` check in `fattn-tile.cu`/`mmvq.cu` next step. `FUTURE_RESEARCH.md` `v_dot8_i32_i4`, `hipSetDevice` caching, `fused QKV` remain deferred single-GPU candidates.
 
 ---
 
