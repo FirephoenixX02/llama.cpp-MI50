@@ -224,13 +224,14 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-rdna3.cuh"
 #include "mmq-config-rdna3-5.cuh"
 #include "mmq-config-rdna4.cuh"
+#include "mmq-config-vega.cuh"
 
 #undef CASE
 
 static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type type, const int J, const bool fallback, const int cc, const ggml_prec prec_src1 = GGML_PREC_Q8) {
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_GCN(cc)) {
-            return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+            return ggml_cuda_mmq_get_config_vega(type, J, fallback);
         }
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
             return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
@@ -264,8 +265,8 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
 #ifdef GGML_USE_HIP
-#ifdef GCN
-    return ggml_cuda_mmq_get_config_gcn(type, J, fallback);
+<#if defined(GCN) || defined(__gfx906__)
+    return ggml_cuda_mmq_get_config_vega(type, J, fallback);
 #elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
 #elif defined(RDNA4)
@@ -276,7 +277,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
     return ggml_cuda_mmq_get_config_rdna3(type, J, fallback);
 #else
     return ggml_cuda_mmq_get_config_rdna2(type, J, fallback);
-#endif // CDNA
+#endif // GCN/CDNA
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
     // only src1 at Q4 uses the native FP4 config, higher precisions keep src1 at Q8_1
