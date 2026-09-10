@@ -70,7 +70,9 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#if defined(GGML_USE_HIP) && defined(GCN)
 #include "ggml-cuda/gfx906-mi50-opts.cuh"
+#endif
 #include "ggml.h"
 
 #include <algorithm>
@@ -217,8 +219,22 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP) && defined(GCN)
+// Force retention of mi50 kernels (otherwise HIP may DCE them when not dispatched)
+static void ggml_cuda_mi50_force_link() {
+    // reference device symbols to keep them in HSACO
+    auto p1 = (void*) &mi50_gemv_dual_fused_4x;
+    auto p2 = (void*) &mi50_gemv_v8_t16;
+    auto p3 = (void*) &mi50_flash_attn_256_v3_prefill;
+    (void)p1; (void)p2; (void)p3;
+}
+#endif
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
+#if defined(GGML_USE_HIP) && defined(GCN)
+    ggml_cuda_mi50_force_link();
+#endif
 
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {

@@ -326,7 +326,16 @@ Source: `mi50grad/` `gfx906` standalone `HIP` stack (`4×MI50` `27B GPTQ-Int4` `
 | 26 | `GEMV v8` 4× | `gfx906-mi50-opts.cuh:80` `mi50_gemv_v8_coop<4/8/16>` | `4×` words/iter `acc0/1`, `FP32-only` `dequant_dot8_fp32` (vs `fdot2` FP16), `TPC_PER_WF` `DPP` `__shfl_down(COLS_PER_WG)` + `LDS 4*COLS_PER_WG`. Copy `gemv_int4_v8.hip:51` `gemv_int4_v8_cooperative`. `t16/t8/t4` `256` threads. | Compiled, gated |
 | 27 | `FlashAttn 256 v3` | `gfx906-mi50-opts.cuh:140` `mi50_flash_attn_256_v3_prefill` | `BLOCK_M=16 BLOCK_N=16`, `4 WF ×4 Q rows ×16 dims` `qreg[16]`, `8×fdot2` `v_dot2_f32_f16` per score, `16-way shfl_down 8/4/2/1` + `shfl` broadcast, `LDS 16KB` (`k_lds/v_lds` `8K+8K`) `float4` loads, `online softmax` `expf`. Copy `flash_attn_256_v3.hip:188`. Single-GPU prefill only. | Compiled, gated |
 
-`gfx906-mi50-opts.cuh` is `GCN`-only (`#if defined(GGML_USE_HIP) && defined(GCN)`) so no `CDNA/RDNA/NV` impact; included via `ggml-cuda.cu:73` `#include "gfx906-mi50-opts.cuh"`. Kernels are `__global__` but not yet auto-dispatched — activate via `GGML_CUDA_MI50_DUAL_V8` / `FLASH_V3` env or explicit `cc==906 && head_dim==256` check in `fattn-tile.cu`/`mmvq.cu` next step. `FUTURE_RESEARCH.md` `v_dot8_i32_i4`, `hipSetDevice` caching, `fused QKV` remain deferred single-GPU candidates.
+`gfx906-mi50-opts.cuh` is `GCN`-only (`#if defined(GGML_USE_HIP) && defined(GCN)`) so no `CDNA/RDNA/NV` impact; included via `ggml-cuda.cu:73` `#include "gfx906-mi50-opts.cuh"`. **Fix 2026-09-10:** kernels were `Gated` but `DCE`'d (no reference) → added `ggml_cuda_mi50_force_link()` in `ggml_cuda_init()` (`ggml-cuda.cu:220`) to retain `HSACO` (`&mi50_gemv_dual_fused_4x`, `&mi50_gemv_v8_t16`, `&mi50_flash_attn_256_v3_prefill`). `RMSNorm` vectorized is auto-dispatched (`norm.cu:304` `GCN && ncols%4==0`); `dual 4×`/`GEMV v8`/`FA v3` remain gated `GCN` for `GPTQ`/`head_dim 256` (`Q4_K` repack wiring pending) — `FUTURE_RESEARCH.md` `v_dot8`, `hipSetDevice`, `fused QKV` deferred.
+
+### Benchmarks (1×MI50, ROCm 7.2.4, `GGML_CUDA_REPACK=1`, `-ngl 99 -p512 -n128 -r5`, `gfx906`)
+
+| Model | Baseline `f51aa0ab2` | With `turbo+mi50` `3e74eea27` (tuned) | Delta |
+|---|---|---|---|
+| `Qwen3.5-9B UD-Q4_K_XL` (dense 8.95B) | `pp512 647.83±4.32` `tg128 70.77±0.36` | `pp512 646.92±5.10` `tg128 71.43±0.25` | `pp -0.1%` `tg +0.9%` — neutral within variance |
+| `Ling-3.0-tiny Q8_0` (MoE 7.9B `bailingmoe3`) | `pp512 2076.98±75.30` `tg128 109.93±0.63` | `pp512 2082.00±73.82` `tg128 110.83±0.29` | `pp +0.2%` `tg +0.8%` — small MoE gain (`add-id` `vec4` + `Q8_0` `b2_fast`) |
+
+`Qwen` dense `Q4_K` shows no gain (expected — `dual`/`v8`/`FA v3` target `GPTQ`/`256` head, not `Q4_K`); `Ling` `Q8_0` MoE shows `+0.9 tok/s` `tg` via `add-id` `vec4` and `vecdotq` `Q8_0` fast path. `RMSNorm` `float4` neutral on `5120` dims (already `DPP` `1.43×` in `mi50grad`). `build-llamacpp-rocm.sh` `+53` (`norm.cu`) `+233` (`gfx906-mi50-opts.cuh`) built ok.
 
 ---
 
