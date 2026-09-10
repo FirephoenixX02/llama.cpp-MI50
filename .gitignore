@@ -44,6 +44,7 @@
 /tags
 /.build/
 /build*
+!/build-llamacpp-rocm.sh
 /release
 /debug
 /libllama.so
