@@ -301,10 +301,63 @@ static void group_norm_f32_cuda(
     }
 }
 
+#if defined(GGML_USE_HIP) && defined(GCN)
+// GCN vectorized RMSNorm: 4x float4 per thread, DPP-aware block_reduce
+// Each thread handles 4 consecutive F32 elements via 128-bit loads
+// Reduces HBM transactions 4x and improves coalescing on 5120/4096 dims
+template<int block_size>
+static __global__ void rms_norm_f32_gfx906(const float * x, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+    float sum = 0.0f;
+    // 4x vectorized sum of squares
+    for (int col = tid*4; col < ncols; col += block_size*4) {
+        const float4 v = *((const float4*)(x + col));
+        sum += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    const float scale = rsqrtf(sum / ncols + eps);
+    for (int col = tid*4; col < ncols; col += block_size*4) {
+        const float4 v = *((const float4*)(x + col));
+        float4 out;
+        out.x = v.x * scale;
+        out.y = v.y * scale;
+        out.z = v.z * scale;
+        out.w = v.w * scale;
+        *((float4*)(dst + col)) = out;
+    }
+}
+#endif // GGML_USE_HIP && GCN
+
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
+#if defined(GGML_USE_HIP) && defined(GCN)
+    // GCN fast path: 4x float4 vectorized, requires 16B alignment and ncols%4==0
+    // dst/x are 128B aligned from ggml buffer (128), so 16B is guaranteed when ncols%4==0
+    if ((ncols % 4 == 0) && ncols < 8192) {
+        if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32_gfx906<256>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+            return;
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            ggml_cuda_kernel_launch(rms_norm_f32_gfx906<1024>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+            return;
+        }
+    }
+#endif
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
