@@ -335,6 +335,70 @@ static __global__ void rms_norm_f32_gfx906(const float * x, float * dst, const i
         *((float4*)(dst + col)) = out;
     }
 }
+
+// GCN vectorized fused RMSNorm+MUL(+ADD): keeps 4x float4 x-path, scalar mul/add (still 1 launch vs 2).
+// Saves the 23k scale_f32 + 23k bin_bcast pattern: rms_norm (3.6us) + mul/add (3.6us) -> 1 launch.
+// Requirement: ncols%4==0, ncols<8192. mul/add can be any broadcast - scalar lookup is correctness-safe.
+template<int block_size, bool do_add>
+static __global__ void rms_norm_f32_gfx906_fused(const float * x, const float * mul, const float * add, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const uint3 mul_ncols_packed, const uint3 mul_nrows_packed, const uint3 mul_nchannels_packed, const uint3 mul_nsamples_packed,
+        const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+        const uint3 add_ncols_packed, const uint3 add_nrows_packed, const uint3 add_nchannels_packed, const uint3 add_nsamples_packed) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+    const float * x_row = x + sample*stride_sample + channel*stride_channel + row*stride_row;
+    float * dst_row = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    const float * mul_row = nullptr;
+    const float * add_row = nullptr;
+    if (mul) {
+        const uint32_t mr = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mc = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t ms = fastmodulo(sample, mul_nsamples_packed);
+        mul_row = mul + ms*mul_stride_sample + mc*mul_stride_channel + mr*mul_stride_row;
+    }
+    if constexpr (do_add) {
+        const uint32_t ar = fastmodulo(row, add_nrows_packed);
+        const uint32_t ac = fastmodulo(channel, add_nchannels_packed);
+        const uint32_t as = fastmodulo(sample, add_nsamples_packed);
+        add_row = add + as*add_stride_sample + ac*add_stride_channel + ar*add_stride_row;
+    }
+
+    float sum = 0.0f;
+    for (int col = tid*4; col < ncols; col += block_size*4) {
+        const float4 v = *((const float4*)(x_row + col));
+        sum += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, s_sum);
+    const float scale = rsqrtf(sum / ncols + eps);
+    for (int col = tid*4; col < ncols; col += block_size*4) {
+        const float4 v = *((const float4*)(x_row + col));
+        // scalar mul/add lookup keeps correctness for any broadcast, x stays vectorized
+        float mx0 = mul ? mul_row[fastmodulo(col, mul_ncols_packed)] : 1.0f;
+        float mx1 = mul ? mul_row[fastmodulo(col+1, mul_ncols_packed)] : 1.0f;
+        float mx2 = mul ? mul_row[fastmodulo(col+2, mul_ncols_packed)] : 1.0f;
+        float mx3 = mul ? mul_row[fastmodulo(col+3, mul_ncols_packed)] : 1.0f;
+        float4 out;
+        out.x = v.x * scale * mx0;
+        out.y = v.y * scale * mx1;
+        out.z = v.z * scale * mx2;
+        out.w = v.w * scale * mx3;
+        if constexpr (do_add) {
+            out.x += add_row[fastmodulo(col, add_ncols_packed)];
+            out.y += add_row[fastmodulo(col+1, add_ncols_packed)];
+            out.z += add_row[fastmodulo(col+2, add_ncols_packed)];
+            out.w += add_row[fastmodulo(col+3, add_ncols_packed)];
+        }
+        *((float4*)(dst_row + col)) = out;
+    }
+}
 #endif // GGML_USE_HIP && GCN
 
 static void rms_norm_f32_cuda(
@@ -408,6 +472,53 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
     }
+#if defined(GGML_USE_HIP) && defined(GCN)
+    // GCN fused fast path: keep 4x vectorized x, scalar mul/add broadcast
+    if ((ncols % 4 == 0) && ncols < 8192) {
+        const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+        const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+        const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+        const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+        const uint3 add_ncols_packed     = add ? init_fastdiv_values(add_ncols) : make_uint3(0,0,0);
+        const uint3 add_nrows_packed     = add ? init_fastdiv_values(add_nrows) : make_uint3(0,0,0);
+        const uint3 add_nchannels_packed = add ? init_fastdiv_values(add_nchannels) : make_uint3(0,0,0);
+        const uint3 add_nsamples_packed  = add ? init_fastdiv_values(add_nsamples) : make_uint3(0,0,0);
+        const int64_t ar  = add ? add_stride_row : 0;
+        const int64_t ac  = add ? add_stride_channel : 0;
+        const int64_t as  = add ? add_stride_sample : 0;
+        if (ncols < 1024) {
+            const dim3 block_dims(256, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            if (add == nullptr) {
+                ggml_cuda_kernel_launch(rms_norm_f32_gfx906_fused<256, false>, launch_params,
+                    x, mul, nullptr, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+                    mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    0, 0, 0, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            } else {
+                ggml_cuda_kernel_launch(rms_norm_f32_gfx906_fused<256, true>, launch_params,
+                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+                    mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    ar, ac, as, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            }
+            return;
+        } else {
+            const dim3 block_dims(1024, 1, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+            if (add == nullptr) {
+                ggml_cuda_kernel_launch(rms_norm_f32_gfx906_fused<1024, false>, launch_params,
+                    x, mul, nullptr, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+                    mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    0, 0, 0, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            } else {
+                ggml_cuda_kernel_launch(rms_norm_f32_gfx906_fused<1024, true>, launch_params,
+                    x, mul, add, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+                    mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                    ar, ac, as, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed);
+            }
+            return;
+        }
+    }
+#endif
     if (add == nullptr) {
         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
