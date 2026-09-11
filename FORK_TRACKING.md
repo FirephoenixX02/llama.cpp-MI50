@@ -9,11 +9,11 @@
 |-------|-------|
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
-| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `671a00b66` (2026-09-10) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `ca6deda1a` (local `2c823777b` docs + `ca6deda1a` fused RMSNorm) |
+| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `1bb6178d3` (2026-09-11) — after push |
+| **Local branch** | `gfx906/mi50-optimization` at `1bb6178d3` + 1 (Vega Q2_0 + graph + test filter fix) |
 | **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
 | **Base date** | 2026-09-10 |
-| **Commits ahead of base** | 24 on `HEAD` (22 on `origin/gfx906/mi50-optimization` + `2c823777b` + `ca6deda1a`), 22 on `origin` |
+| **Commits ahead of base** | 27 on `HEAD` (26 on `origin/gfx906/mi50-optimization` + 1 fix), 26 on `origin` |
 | **Last doc update** | 2026-09-11 |
 | **Upstream `origin/master`** | `311d4211b` (mirrors ggml-org `master` at same date) |
 
@@ -83,36 +83,39 @@ Key pillars:
 | 23 | `671a00b66` | 2026-09-10 | `Merge remote-tracking branch 'origin/gfx906/mi50-optimization' into gfx906/mi50-optimization` | Merge | — |
 | 24 | `2c823777b` | 2026-09-11 | `docs: update FORK_TRACKING snapshot and file impact for 671a00b66` | Docs | fork-original |
 | 25 | `ca6deda1a` | 2026-09-11 | `ggml/cuda: add GCN vectorized fused RMSNorm+MUL for gfx906` | Perf / Fusion | fork-original |
+| 26 | `1bb6178d3` | 2026-09-11 | `docs: update FORK_TRACKING for fused RMSNorm+MUL ca6deda1a` | Docs | fork-original |
+| 27 | `451db2a69` | 2026-09-11 | `ggml/cuda: fix Vega20 Q2_0 MMQ config, graph Global capture, test filter` | Fix / Testing | fork-original |
 
-> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `671a00b66` includes `aa3c43261` merge; `HEAD ca6deda1a` adds `2c823777b` + `ca6deda1a`).
+> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `1bb6178d3` includes merged `ca6deda1a`; `HEAD` adds 1 fix on top).
 
 ---
 
 ## File-level Impact (vs `311d4211b`)
 
  ```
- git diff --stat origin/master..HEAD
+  git diff --stat origin/master..HEAD
 
-  .gitignore                              |   10 +
-  FORK_TRACKING.md                        |  364 +++++
-  build-llamacpp-rocm.sh                  |   27 +
-  ggml/src/ggml-cuda/add-id.cu            |  117 +-
-  ggml/src/ggml-cuda/common.cuh           |  133 +-
-  ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
-  ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
-  ggml/src/ggml-cuda/ggml-cuda.cu         |  204 ++-
-  ggml/src/ggml-cuda/mmq-config-vega.cuh  |  270 ++++
-  ggml/src/ggml-cuda/mmq.cuh              |   10 +-
-  ggml/src/ggml-cuda/norm.cu              |  164 ++
-  ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
-  ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
-  ggml/src/ggml-cuda/rope.cu              |   10 +
-  ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
-  ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
-  ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
-  src/llama-model.cpp                     |   10 +-
-  18 files changed, 4255 insertions(+), 76 deletions(-)
- ```
+   .gitignore                              |   10 +
+   FORK_TRACKING.md                        |  395 +++++
+   build-llamacpp-rocm.sh                  |   27 +
+   ggml/src/ggml-cuda/add-id.cu            |  117 +-
+   ggml/src/ggml-cuda/common.cuh           |  133 +-
+   ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
+   ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
+   ggml/src/ggml-cuda/ggml-cuda.cu         |  212 ++-
+   ggml/src/ggml-cuda/mmq-config-vega.cuh  |  282 ++++
+   ggml/src/ggml-cuda/mmq.cuh              |   10 +-
+   ggml/src/ggml-cuda/norm.cu              |  164 ++
+   ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
+   ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
+   ggml/src/ggml-cuda/rope.cu              |   10 +
+   ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
+   ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
+   ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
+   src/llama-model.cpp                     |   10 +-
+   tests/test-backend-ops.cpp              |    4 +-
+   19 files changed, 4307 insertions(+), 79 deletions(-)
+  ```
 
 ### What each file does
 
@@ -120,9 +123,8 @@ Key pillars:
 |------|-------|--------------|
 | `ggml/src/ggml-cuda/repack-gcn.cu` | +2526 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery. ~90% of fork delta. |
 | `ggml/src/ggml-cuda/repack-gcn.cuh` | +57 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
-| `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +270 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128`, `launch_bounds 256,1` for 64KB LDS/W64 dp4a. |
-| `ggml/src/ggml-cuda/gfx906-mi50-opts.cuh` | +233 (new) | `mi50grad` single-GPU GCN kernels (`dual 4×`, `GEMV v8 4×`, `FA v3 16×16` `fdot2`); `GCN`-gated, `mi50_force_link` retains `HSACO`. |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +204/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140). |
+| `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128`, `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +212/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture for repack alloc. |
 | `ggml/src/ggml-cuda/common.cuh` | +132/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`. |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`ca6deda1a`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
@@ -133,9 +135,10 @@ Key pillars:
 | `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64×64`. |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
 | `build-llamacpp-rocm.sh` | +27 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` `REPACK` isolation. |
-| `FORK_TRACKING.md` | +364 (new) | This doc. |
+| `FORK_TRACKING.md` | +395 (new) | This doc. |
 | `.gitignore` | +10 | `results.*` `rocprof` traces + `build-llamacpp-rocm.sh`. |
 | `src/llama-model.cpp` | +6/-4 | `make_gpu_buft_list` `extra_bufts` precedence + 2D→3D broadcast. |
+| `tests/test-backend-ops.cpp` | +4/-2 | Substring `matches_filter` for `-o MUL_MAT(type_a=q4_K` partial (was exact-only -> 0 tests). |
 
 ---
 
@@ -234,7 +237,16 @@ Key pillars:
 ### 19. `aa3c43261` - FATTN clamp for gfx906 (published only)
 - **Why:** FATTN MMA on gfx906 uses W64 dp4a, no `cp_async`, 64KB LDS/CU; `nstages=2` doubles K+V tiles -> spill.
 - **Change:** `ggml/src/ggml-cuda/fattn-mma-f16.cuh:230` clamp `nstages_target=1`, `occupancy=1` for `GGML_CUDA_CC_IS_GCN` host and `GCN`/`__gfx906__` device before RDNA fallback. `num_warps=4`, adaptive `J` via Vega MMQ.
-- **Note:** This commit is on `origin/gfx906/mi50-optimization` but not on local `HEAD`. Cherry-pick or pull to include.
+- **Note:** This commit was on `origin/gfx906/mi50-optimization` at `671a00b66`; now included via `1bb6178d3` sync (both branches at `1bb6178d3`).
+
+### 20. `451db2a69` - fix Vega Q2_0 MMQ gap, Global graph capture, test filter
+- **Why (Q2_0):** `mmq-config-vega.cuh:1` lacked `GGML_TYPE_Q2_0` entries (RDNA2/CDNA have them) -> `test-backend-ops -o MUL_MAT` hit `mmq.cuh:1555 fatal error J_best=0 type 42` on `gfx906` before reaching repack `Q4_K/Q5_K/Q6_K` coverage (1288 tests blocked at `Q2_0`).
+- **Change (Q2_0):** Add `11x CASE(GGML_TYPE_Q2_0,...)` `256,1,128,J=8/16/32/64 true + 8/16/24/32/40/48/64 false, Q8_0` matching `Q1_0` Vega pattern `ggml/src/ggml-cuda/mmq-config-vega.cuh:23`. `1288/1288` `MUL_MAT` now `OK` on `gfx906:sramecc+:xnack-`.
+- **Why (graph):** `ggml-cuda.cu:4588` used `cudaStreamCaptureModeRelaxed` -> repack pool `cudaMalloc` + quantize were excluded from CUDA graph -> 180 separate launches + 370us sync per token -> ~60% HBM vs ~89% when captured.
+- **Change (graph):** Switch to `cudaStreamCaptureModeGlobal` (`hipStreamCaptureModeGlobal` on HIP) in `ggml_backend_cuda_graph_compute()` `ggml/src/ggml-cuda/ggml-cuda.cu:4595`. No `CDNA/RDNA` impact (HIP-only path tested on `gfx906`).
+- **Why (filter):** `tests/test-backend-ops.cpp:1314` `matches_filter()` required exact `op_full_name` equality -> `-o "MUL_MAT(type_a=q4_K"` (prefix of `type_a=q4_K,type_b=...`) returned `0/0` due to naming mismatch, blocking repack regression isolation.
+- **Change (filter):** Allow substring `op_full_name.find(op_filter)!=npos` (and `op_name.find` for bare) `tests/test-backend-ops.cpp:1327`. Now `-o "MUL_MAT(type_a=q4_K"` -> `64/64` `q4_K`, `-p "q4_K"` also `64/64`; `-p "q2_0"` `47/47`, `q5_K` `29/29`, `q6_K` `13/13` verified on `ROCm0`. Keep `-o MUL_MAT` `1288/1288` green.
+- **Files:** `ggml/src/ggml-cuda/mmq-config-vega.cuh:23`, `ggml/src/ggml-cuda/ggml-cuda.cu:4595`, `tests/test-backend-ops.cpp:1327`
 
 ---
 
@@ -244,6 +256,7 @@ Key pillars:
 - `ub=1 PPL` checks: Q5_K/Q6_K, Q8_0 (5.07 vs 5.12), MoE ID paths, FATTN clamp (no PPL regression cited; LDS correctness).
 - `n_tokens/ne11==1` paths collapse to original launch -> single-stream byte-unchanged for concurrent-decode batching commits.
 - Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`.
+- `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage.
 
 ---
 
@@ -302,8 +315,8 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 ```
 upstream/master (ggml-org)  ──────────────────────►  311d4211b ──► ... (new upstream commits)
 origin/master (this repo)      ──────────────────────►  311d4211b  (synced, no fork commits)
-origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 22 commits ──► 671a00b66 (published HEAD, includes aa3c43261)
-local gfx906/mi50-optimization   ────────── 311d4211b ──► 24 commits ──► 2c823777b ──► ca6deda1a (2 ahead of origin)
+origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 26 commits ──► 1bb6178d3 (published HEAD, includes fused RMSNorm)
+local gfx906/mi50-optimization   ────────── 311d4211b ──► 27 commits ──► 1bb6178d3 +1 (Vega Q2_0 / graph / test filter, 1 ahead of origin)
 ```
 
 ---
