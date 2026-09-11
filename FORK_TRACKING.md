@@ -10,10 +10,10 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `1bb6178d3` (2026-09-11) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `1bb6178d3` + 1 (Vega Q2_0 + graph + test filter fix) |
+| **Local branch** | `gfx906/mi50-optimization` at `a0b09660` (2 ahead: Vega fix + docs sync) |
 | **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
 | **Base date** | 2026-09-10 |
-| **Commits ahead of base** | 27 on `HEAD` (26 on `origin/gfx906/mi50-optimization` + 1 fix), 26 on `origin` |
+| **Commits ahead of base** | 28 on `HEAD` (26 on `origin/gfx906/mi50-optimization` + Vega fix + docs sync), 26 on `origin` |
 | **Last doc update** | 2026-09-11 |
 | **Upstream `origin/master`** | `311d4211b` (mirrors ggml-org `master` at same date) |
 
@@ -84,7 +84,8 @@ Key pillars:
 | 24 | `2c823777b` | 2026-09-11 | `docs: update FORK_TRACKING snapshot and file impact for 671a00b66` | Docs | fork-original |
 | 25 | `ca6deda1a` | 2026-09-11 | `ggml/cuda: add GCN vectorized fused RMSNorm+MUL for gfx906` | Perf / Fusion | fork-original |
 | 26 | `1bb6178d3` | 2026-09-11 | `docs: update FORK_TRACKING for fused RMSNorm+MUL ca6deda1a` | Docs | fork-original |
-| 27 | `451db2a69` | 2026-09-11 | `ggml/cuda: fix Vega20 Q2_0 MMQ config, graph Global capture, test filter` | Fix / Testing | fork-original |
+| 27 | `80ad5c79` | 2026-09-11 | `ggml/cuda: fix Vega20 Q2_0 MMQ config, graph Global capture, test filter` | Fix / Testing | fork-original |
+| 28 | `a0b09660` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `1bb6178d3` includes merged `ca6deda1a`; `HEAD` adds 1 fix on top).
 
@@ -239,7 +240,7 @@ Key pillars:
 - **Change:** `ggml/src/ggml-cuda/fattn-mma-f16.cuh:230` clamp `nstages_target=1`, `occupancy=1` for `GGML_CUDA_CC_IS_GCN` host and `GCN`/`__gfx906__` device before RDNA fallback. `num_warps=4`, adaptive `J` via Vega MMQ.
 - **Note:** This commit was on `origin/gfx906/mi50-optimization` at `671a00b66`; now included via `1bb6178d3` sync (both branches at `1bb6178d3`).
 
-### 20. `451db2a69` - fix Vega Q2_0 MMQ gap, Global graph capture, test filter
+### 20. `80ad5c79` - fix Vega Q2_0 MMQ gap, Global graph capture, test filter
 - **Why (Q2_0):** `mmq-config-vega.cuh:1` lacked `GGML_TYPE_Q2_0` entries (RDNA2/CDNA have them) -> `test-backend-ops -o MUL_MAT` hit `mmq.cuh:1555 fatal error J_best=0 type 42` on `gfx906` before reaching repack `Q4_K/Q5_K/Q6_K` coverage (1288 tests blocked at `Q2_0`).
 - **Change (Q2_0):** Add `11x CASE(GGML_TYPE_Q2_0,...)` `256,1,128,J=8/16/32/64 true + 8/16/24/32/40/48/64 false, Q8_0` matching `Q1_0` Vega pattern `ggml/src/ggml-cuda/mmq-config-vega.cuh:23`. `1288/1288` `MUL_MAT` now `OK` on `gfx906:sramecc+:xnack-`.
 - **Why (graph):** `ggml-cuda.cu:4588` used `cudaStreamCaptureModeRelaxed` -> repack pool `cudaMalloc` + quantize were excluded from CUDA graph -> 180 separate launches + 370us sync per token -> ~60% HBM vs ~89% when captured.
@@ -316,7 +317,7 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 upstream/master (ggml-org)  ──────────────────────►  311d4211b ──► ... (new upstream commits)
 origin/master (this repo)      ──────────────────────►  311d4211b  (synced, no fork commits)
 origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 26 commits ──► 1bb6178d3 (published HEAD, includes fused RMSNorm)
-local gfx906/mi50-optimization   ────────── 311d4211b ──► 27 commits ──► 1bb6178d3 +1 (Vega Q2_0 / graph / test filter, 1 ahead of origin)
+local gfx906/mi50-optimization   ────────── 311d4211b ──► 28 commits ──► a0b09660 (Vega fix + docs sync, 2 ahead of origin)
 ```
 
 ---
