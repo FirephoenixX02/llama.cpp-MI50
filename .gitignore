@@ -154,3 +154,12 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# rocprof / debug traces (local only, >3MB json)
+results.json
+results.db
+results.*.csv
+results.stats.csv
+results.hip_stats.csv
+results.copy_stats.csv
+results.sysinfo.txt
