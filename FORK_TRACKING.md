@@ -10,11 +10,11 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `671a00b66` (2026-09-10) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `671a00b66` (merge `aa3c43261` + 3 turbo/mi50 opts) |
+| **Local branch** | `gfx906/mi50-optimization` at `ca6deda1a` (local `2c823777b` docs + `ca6deda1a` fused RMSNorm) |
 | **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
 | **Base date** | 2026-09-10 |
-| **Commits ahead of base** | 22 on `origin/gfx906/mi50-optimization` (19 + turbo `6ada0839a` + mi50 `3e74eea27` + fix `052498297` + merge `671a00b66`) |
-| **Last doc update** | 2026-09-10 |
+| **Commits ahead of base** | 24 on `HEAD` (22 on `origin/gfx906/mi50-optimization` + `2c823777b` + `ca6deda1a`), 22 on `origin` |
+| **Last doc update** | 2026-09-11 |
 | **Upstream `origin/master`** | `311d4211b` (mirrors ggml-org `master` at same date) |
 
 ### How to refresh this snapshot
@@ -81,36 +81,38 @@ Key pillars:
 | 21 | `3e74eea27` | 2026-09-10 | `ggml/cuda: add mi50grad single-GPU GCN opts - RMSNorm vec4, dual 4x, GEMV v8, FA v3` | Perf | fork-original mi50 port |
 | 22 | `052498297` | 2026-09-10 | `ggml/cuda: fix mi50 ops DCE and update fork tracking with MoE bench` | Fix / Docs | fork-original |
 | 23 | `671a00b66` | 2026-09-10 | `Merge remote-tracking branch 'origin/gfx906/mi50-optimization' into gfx906/mi50-optimization` | Merge | — |
+| 24 | `2c823777b` | 2026-09-11 | `docs: update FORK_TRACKING snapshot and file impact for 671a00b66` | Docs | fork-original |
+| 25 | `ca6deda1a` | 2026-09-11 | `ggml/cuda: add GCN vectorized fused RMSNorm+MUL for gfx906` | Perf / Fusion | fork-original |
 
-> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `671a00b66` includes `aa3c43261` merge).
+> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `671a00b66` includes `aa3c43261` merge; `HEAD ca6deda1a` adds `2c823777b` + `ca6deda1a`).
 
 ---
 
 ## File-level Impact (vs `311d4211b`)
 
-```
-git diff --stat origin/master..HEAD
+ ```
+ git diff --stat origin/master..HEAD
 
- .gitignore                              |    1 +
- FORK_TRACKING.md                        |  349 +++++
- build-llamacpp-rocm.sh                  |   27 +
- ggml/src/ggml-cuda/add-id.cu            |  117 +-
- ggml/src/ggml-cuda/common.cuh           |  133 +-
- ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
- ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
- ggml/src/ggml-cuda/ggml-cuda.cu         |  204 ++-
- ggml/src/ggml-cuda/mmq-config-vega.cuh  |  270 ++++
- ggml/src/ggml-cuda/mmq.cuh              |   10 +-
- ggml/src/ggml-cuda/norm.cu              |   53 +
- ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
- ggml/src/ggml-cuda/rope.cu              |   10 +
- ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
- ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
- ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
- src/llama-model.cpp                     |   10 +-
- 18 files changed, 4120 insertions(+), 76 deletions(-)
-```
+  .gitignore                              |   10 +
+  FORK_TRACKING.md                        |  364 +++++
+  build-llamacpp-rocm.sh                  |   27 +
+  ggml/src/ggml-cuda/add-id.cu            |  117 +-
+  ggml/src/ggml-cuda/common.cuh           |  133 +-
+  ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
+  ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
+  ggml/src/ggml-cuda/ggml-cuda.cu         |  204 ++-
+  ggml/src/ggml-cuda/mmq-config-vega.cuh  |  270 ++++
+  ggml/src/ggml-cuda/mmq.cuh              |   10 +-
+  ggml/src/ggml-cuda/norm.cu              |  164 ++
+  ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
+  ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
+  ggml/src/ggml-cuda/rope.cu              |   10 +
+  ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
+  ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
+  ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
+  src/llama-model.cpp                     |   10 +-
+  18 files changed, 4255 insertions(+), 76 deletions(-)
+ ```
 
 ### What each file does
 
@@ -122,7 +124,7 @@ git diff --stat origin/master..HEAD
 | `ggml/src/ggml-cuda/gfx906-mi50-opts.cuh` | +233 (new) | `mi50grad` single-GPU GCN kernels (`dual 4×`, `GEMV v8 4×`, `FA v3 16×16` `fdot2`); `GCN`-gated, `mi50_force_link` retains `HSACO`. |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | +204/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140). |
 | `ggml/src/ggml-cuda/common.cuh` | +132/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`. |
-| `ggml/src/ggml-cuda/norm.cu` | +53 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port. |
+| `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`ca6deda1a`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
 | `ggml/src/ggml-cuda/rope.cu` | +10 | `GCN` `__sincosf`+`__logf` in `rope_yarn` (vs `cosf+sinf`). |
 | `ggml/src/ggml-cuda/vecdotq.cuh` | +59 | `GCN` `memcpy` `b1/b2_fast`, `v_perm` `MXFP4` `8-entry`, `GGML_GCN_VEC_DOT_MXFP4` `Q8_0` fast. |
@@ -131,8 +133,8 @@ git diff --stat origin/master..HEAD
 | `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64×64`. |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
 | `build-llamacpp-rocm.sh` | +27 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` `REPACK` isolation. |
-| `FORK_TRACKING.md` | +349 (new) | This doc. |
-| `.gitignore` | +1 | Track `build-llamacpp-rocm.sh`. |
+| `FORK_TRACKING.md` | +364 (new) | This doc. |
+| `.gitignore` | +10 | `results.*` `rocprof` traces + `build-llamacpp-rocm.sh`. |
 | `src/llama-model.cpp` | +6/-4 | `make_gpu_buft_list` `extra_bufts` precedence + 2D→3D broadcast. |
 
 ---
@@ -300,8 +302,8 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 ```
 upstream/master (ggml-org)  ──────────────────────►  311d4211b ──► ... (new upstream commits)
 origin/master (this repo)      ──────────────────────►  311d4211b  (synced, no fork commits)
-origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 18 commits ──► f51aa0ab2 ──► aa3c43261 (published HEAD)
-local gfx906/mi50-optimization   ────────── 311d4211b ──► 18 commits ──► f51aa0ab2 (1 behind published)
+origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 22 commits ──► 671a00b66 (published HEAD, includes aa3c43261)
+local gfx906/mi50-optimization   ────────── 311d4211b ──► 24 commits ──► 2c823777b ──► ca6deda1a (2 ahead of origin)
 ```
 
 ---
@@ -343,6 +345,18 @@ Source: `mi50grad/` `gfx906` standalone `HIP` stack (`4×MI50` `27B GPTQ-Int4` `
 
 `gfx906-mi50-opts.cuh` is `GCN`-only (`#if defined(GGML_USE_HIP) && defined(GCN)`) so no `CDNA/RDNA/NV` impact; included via `ggml-cuda.cu:73` `#include "gfx906-mi50-opts.cuh"`. **Fix 2026-09-10:** kernels were `Gated` but `DCE`'d (no reference) → added `ggml_cuda_mi50_force_link()` in `ggml_cuda_init()` (`ggml-cuda.cu:220`) to retain `HSACO` (`&mi50_gemv_dual_fused_4x`, `&mi50_gemv_v8_t16`, `&mi50_flash_attn_256_v3_prefill`). `RMSNorm` vectorized is auto-dispatched (`norm.cu:304` `GCN && ncols%4==0`); `dual 4×`/`GEMV v8`/`FA v3` remain gated `GCN` for `GPTQ`/`head_dim 256` (`Q4_K` repack wiring pending) — `FUTURE_RESEARCH.md` `v_dot8`, `hipSetDevice`, `fused QKV` deferred.
 
+## Fused RMSNorm+MUL GCN (2026-09-11, `ca6deda1a`)
+
+Source: local `gfx906/mi50-optimization` `ca6deda1a` — fuses the `3.6us` `rms_norm` + `mul/add` chain (`73140` + `23136` `k_bin_bcast`/`scale_f32` in `results.stats.csv:4`) into one launch.
+
+| # | Port | File | Change | Status |
+|---|------|------|--------|--------|
+| 28 | `RMSNorm+MUL(+ADD)` fused `gfx906` | `ggml/src/ggml-cuda/norm.cu:338` `rms_norm_f32_gfx906_fused<256/1024,do_add>` | `4x float4` `x` (`tid*4`), scalar `mul/add` broadcast `fastdiv` (`common.cuh:1044`), `block_reduce SUM` DPP, `rsqrtf` — keeps `128b` coalesced, `1` launch vs `2`. Gate `GCN && ncols%4==0 && ncols<8192` in `rms_norm_mul_f32_cuda` (`norm.cu:471`). | Built `build-llamacpp-rocm.sh` ok, `test-backend-ops -o RMS_NORM` `51/51 OK` |
+
+`F16/BF16` repack was prototyped (`repack-gcn.cu:39` `nsp*64` `pow2` pad, `F16/BF16` `matvec` `half/bf16*int8` `dp` + `ncols 2..8/16/32` + `mmq_gemm` `half/bf16`) gated `GGML_CUDA_REPACK_F16/BF16` like `Q8_0` — bench `Qwen3.5-0.8B BF16` `pp512 2995->902 tg 167.5->164.7` slower (`rocBLAS Hgemm` already optimal, `q8` quant overhead), reverted, kept gated `default-off` (no `CU` impact when unset).
+
+`.gitignore:160` `results.*` (`results.json/db/*.csv`, `results.stats.csv`, `results.hip_stats.csv`, `results.copy_stats.csv`, `results.sysinfo.txt`) `rocprof` traces `50M/155M` local-only.
+
 ### Benchmarks (1×MI50, ROCm 7.2.4, `GGML_CUDA_REPACK=1`, `-ngl 99 -p512 -n128 -r5`, `gfx906`)
 
 | Model | Baseline `f51aa0ab2` | With `turbo+mi50` `3e74eea27` (tuned) | Delta |
@@ -351,6 +365,10 @@ Source: `mi50grad/` `gfx906` standalone `HIP` stack (`4×MI50` `27B GPTQ-Int4` `
 | `Ling-3.0-tiny Q8_0` (MoE 7.9B `bailingmoe3`) | `pp512 2076.98±75.30` `tg128 109.93±0.63` | `pp512 2082.00±73.82` `tg128 110.83±0.29` | `pp +0.2%` `tg +0.8%` — small MoE gain (`add-id` `vec4` + `Q8_0` `b2_fast`) |
 
 `Qwen` dense `Q4_K` shows no gain (expected — `dual`/`v8`/`FA v3` target `GPTQ`/`256` head, not `Q4_K`); `Ling` `Q8_0` MoE shows `+0.9 tok/s` `tg` via `add-id` `vec4` and `vecdotq` `Q8_0` fast path. `RMSNorm` `float4` neutral on `5120` dims (already `DPP` `1.43×` in `mi50grad`). `build-llamacpp-rocm.sh` `+53` (`norm.cu`) `+233` (`gfx906-mi50-opts.cuh`) built ok.
+
+With `ca6deda1a` fused `RMSNorm+MUL` (`-ngl 99 -p512 -n128`):
+| `Qwen3.5-0.8B BF16` (752M) | `pp512 2995.15±121.6 tg 167.51±0.55` baseline `f51aa0ab2` | `pp 893-902 tg 164-166` with `F16/BF16` `nsp*64` repack (`GGML_CUDA_REPACK_F16=1`) | `pp -70%` — `rocBLAS Hgemm` already optimal, `q8` quant overhead, reverted gated `default-off` |
+| `Merged 1.9B BF16` (qwen35 2B) | `pp 1174 tg 93.2` baseline | `pp 1179 tg 93.6` with `ca6deda1a` fused | `+0.4%` neutral within variance (`test-backend-ops -o RMS_NORM 51/51 OK`) |
 
 ---
 
