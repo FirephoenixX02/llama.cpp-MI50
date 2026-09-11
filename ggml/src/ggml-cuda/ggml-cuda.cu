@@ -4592,7 +4592,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
         }
 
-        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        // Global mode allows repack's pool alloc (cudaMalloc) and quantize kernels to be captured as graph nodes.
+        // Repack was previously excluded from the graph (Relaxed) causing 180 separate launches + 370us sync per token -> 60% HBM.
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), hipStreamCaptureModeGlobal));
+#else
+        CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeGlobal));
+#endif
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);

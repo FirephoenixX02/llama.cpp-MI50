@@ -1324,12 +1324,12 @@ struct test_case {
                     auto rparen_pos = filter.find_first_of(')');
                     comma_pos = filter.find_first_of(',', rparen_pos);
                     const auto op_filter = filter.substr(0, comma_pos);
-                    if (op_filter == op_full_name) {
+                    if (op_filter == op_full_name || op_full_name.find(op_filter) != std::string::npos) {
                         return true;
                     }
                 } else {
                     const auto op_filter = filter.substr(0, comma_pos);
-                    if (op_filter == op_name) {
+                    if (op_filter == op_name || op_name.find(op_filter) != std::string::npos) {
                         return true;
                     }
                 }
