@@ -10,7 +10,7 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `1bb6178d3` (2026-09-11) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `a0b09660` (2 ahead: Vega fix + docs sync) |
+| **Local branch** | `gfx906/mi50-optimization` at `1bb6178d3` +2 (Vega fix `80ad5c79` + docs sync) |
 | **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
 | **Base date** | 2026-09-10 |
 | **Commits ahead of base** | 28 on `HEAD` (26 on `origin/gfx906/mi50-optimization` + Vega fix + docs sync), 26 on `origin` |
@@ -85,7 +85,7 @@ Key pillars:
 | 25 | `ca6deda1a` | 2026-09-11 | `ggml/cuda: add GCN vectorized fused RMSNorm+MUL for gfx906` | Perf / Fusion | fork-original |
 | 26 | `1bb6178d3` | 2026-09-11 | `docs: update FORK_TRACKING for fused RMSNorm+MUL ca6deda1a` | Docs | fork-original |
 | 27 | `80ad5c79` | 2026-09-11 | `ggml/cuda: fix Vega20 Q2_0 MMQ config, graph Global capture, test filter` | Fix / Testing | fork-original |
-| 28 | `a0b09660` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
+| 28 | `HEAD` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `1bb6178d3` includes merged `ca6deda1a`; `HEAD` adds 1 fix on top).
 
