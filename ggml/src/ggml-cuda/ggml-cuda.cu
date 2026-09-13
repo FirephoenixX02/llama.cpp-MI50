@@ -72,11 +72,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
-<<<<<<< HEAD
 #include "ggml-cuda/top-k-mask.cuh"
-=======
 #if defined(GGML_USE_HIP) && defined(GCN)
->>>>>>> 05526fce6 (ggml/cuda: fix mi50 ops DCE and update fork tracking with MoE bench)
 #include "ggml-cuda/gfx906-mi50-opts.cuh"
 #endif
 #include "ggml.h"
@@ -3140,7 +3137,59 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGraph_t cuda_graph) {
+static void ggml_cuda_graph_update_executable(ggml_cuda_graph * graph, size_t idx, cudaGraph_t cuda_graph) {
+    cudaGraphExec_t & instance = graph->instances[idx];
+#if defined(GGML_USE_HIP)
+    // hipGraphExecUpdate applies a kernel-function change without validating
+    // launch geometry. When the kernel choice shifts between captures (e.g.
+    // MUL_MAT_ID crossing the MMVQ batch threshold swaps quantize_mmq_q8_1
+    // (128 threads) and quantize_q8_1<32>), the exec ends with block dims
+    // over the new kernel's launch bounds - undefined behavior at replay.
+    // Pointer-only updates with an unchanged function set are safe and much
+    // cheaper than re-instantiating, so compare the captured kernel functions
+    // against the previous capture and only re-instantiate on a change.
+    bool funcs_changed = false;
+    {
+        size_t n_nodes = 0;
+        CUDA_CHECK(hipGraphGetNodes(cuda_graph, nullptr, &n_nodes));
+        std::vector<hipGraphNode_t> nodes(n_nodes);
+        if (n_nodes > 0) {
+            CUDA_CHECK(hipGraphGetNodes(cuda_graph, nodes.data(), &n_nodes));
+        }
+        std::vector<const void *> funcs;
+        funcs.reserve(n_nodes);
+        for (size_t i = 0; i < n_nodes; ++i) {
+            hipGraphNodeType type;
+            CUDA_CHECK(hipGraphNodeGetType(nodes[i], &type));
+            if (type != hipGraphNodeTypeKernel) {
+                continue;
+            }
+            hipKernelNodeParams p;
+            CUDA_CHECK(hipGraphKernelNodeGetParams(nodes[i], &p));
+            funcs.push_back(p.func);
+        }
+        funcs_changed = funcs != graph->kernel_funcs;
+        graph->kernel_funcs = std::move(funcs);
+    }
+    if (funcs_changed) {
+        GGML_LOG_DEBUG("%s: HIP: kernel set changed, re-instantiating graph exec\n", __func__);
+        CUDA_CHECK(cudaGraphExecDestroy(instance));
+        instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&instance, cuda_graph, NULL, NULL, 0));
+        return;
+    }
+    {
+        hipGraphNode_t errorNode;
+        hipGraphExecUpdateResult result_info;
+        hipError_t stat = hipGraphExecUpdate(instance, cuda_graph, &errorNode, &result_info);
+        if (stat != hipSuccess) {
+            (void)hipGetLastError();
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            instance = nullptr;
+            CUDA_CHECK(cudaGraphInstantiate(&instance, cuda_graph, NULL, NULL, 0));
+        }
+    }
+#else
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(instance, cuda_graph, &result_info);
@@ -3164,6 +3213,7 @@ static void ggml_cuda_graph_update_executable(cudaGraphExec_t & instance, cudaGr
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+#endif // defined(GGML_USE_HIP)
 }
 
 // number of ggml nodes per CUDA graph chunk, 0 captures the whole ggml graph as one CUDA graph
@@ -3181,7 +3231,7 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph);
+        ggml_cuda_graph_update_executable(graph, idx, cuda_graph);
     } else {
         GGML_ASSERT(idx == graph->instances.size());
         graph->instances.emplace_back(nullptr);
