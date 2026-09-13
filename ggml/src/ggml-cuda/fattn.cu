@@ -479,6 +479,41 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
+#if defined(GGML_USE_HIP)
+// On GCN (Vega 10/20, incl. MI50/MI60), q8_0 K/V can use the tile kernel with in-kernel dequant.
+// It loads K/V tiles once per CUDA block instead of once per query row (VEC), which matters at
+// large KV depth where attention reads dominate. No F16 shadow buffer is needed for this path.
+// CDNA and RDNA keep the VEC path: untested there, and tensor-core equipped.
+static bool ggml_cuda_fattn_tile_q8_0_native(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 && GGML_CUDA_CC_IS_GCN(cc) &&
+            K->ne[0] == V->ne[0] && K->ne[0] <= 256 && K->ne[0] % 32 == 0 && Q->ne[1] > 2)) {
+        return false;
+    }
+    const uint32_t cfg = ggml_cuda_fattn_tile_get_config_amd(K->ne[0], V->ne[0], K->ne[0] <= 128 ? 64 : 32);
+    const int nbatch_K = (cfg >> 23) & ((1 << 9) - 1);
+    return cfg != 0 && nbatch_K % 32 == 0 && K->ne[0] % nbatch_K == 0;
+}
+
+// Mixed F16 K + q8_0 V on GCN: K keeps the native half2 tile loads, V dequantizes in-kernel.
+// Same shadow skip and Q->ne[1] > 2 rule as the full q8_0 path above.
+static bool ggml_cuda_fattn_tile_v_q8_0_native(const int device, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0 && GGML_CUDA_CC_IS_GCN(cc) &&
+            K->ne[0] == V->ne[0] && V->ne[0] <= 256 && V->ne[0] % 32 == 0 && Q->ne[1] > 2)) {
+        return false;
+    }
+    const uint32_t cfg = ggml_cuda_fattn_tile_get_config_amd(K->ne[0], V->ne[0], K->ne[0] <= 128 ? 64 : 32);
+    return cfg != 0;
+}
+#endif
+
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
@@ -592,6 +627,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+#if defined(GGML_USE_HIP)
+    // HIP quantized-KV TILE/MMA paths materialize large F16 temporary buffers;
+    // VEC dequantizes in-register and is also the safe path on RDNA2.
+    if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel) {
+        // GCN: q8_0 K/V take the native tile kernel when the path decision selects it.
+        if (ggml_cuda_fattn_use_native_tile(device, dst) &&
+                (ggml_cuda_fattn_tile_q8_0_native(device, dst) ||
+                 ggml_cuda_fattn_tile_v_q8_0_native(device, dst))) {
+            return BEST_FATTN_KERNEL_TILE;
+        }
+        if (!(GGML_CUDA_CC_IS_GCN(cc) && Q->ne[1] > 2)) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+        // GCN multi-row: the f16 convert tile beats VEC at deep KV (gfx906, E61),
+        // fall through to the generic flow below.
+    }
+#endif
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {
@@ -685,6 +738,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+#if defined(GGML_USE_HIP)
+            if (ggml_cuda_fattn_use_native_tile(device, dst) &&
+                    (ggml_cuda_fattn_tile_q8_0_native(device, dst) ||
+                     ggml_cuda_fattn_tile_v_q8_0_native(device, dst))) {
+                break; // q8_0 is dequantized in-kernel, no F16 shadow needed
+            }
+#endif
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
