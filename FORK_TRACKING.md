@@ -9,12 +9,12 @@
 |-------|-------|
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
-| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `1bb6178d3` (2026-09-11) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `1bb6178d3` +2 (Vega fix `80ad5c79` + docs sync) |
+| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `41ab374ac` (2026-09-11) — after push |
+| **Local branch** | `gfx906/mi50-optimization` at `9b984f6f8` +1 (GCN native FATTN `9b984f6f8` + docs sync) |
 | **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
 | **Base date** | 2026-09-10 |
-| **Commits ahead of base** | 28 on `HEAD` (26 on `origin/gfx906/mi50-optimization` + Vega fix + docs sync), 26 on `origin` |
-| **Last doc update** | 2026-09-11 |
+| **Commits ahead of base** | 31 on `HEAD` (29 on `origin/gfx906/mi50-optimization` + GCN native FATTN + docs sync), 29 on `origin` |
+| **Last doc update** | 2026-09-13 |
 | **Upstream `origin/master`** | `311d4211b` (mirrors ggml-org `master` at same date) |
 
 ### How to refresh this snapshot
@@ -50,7 +50,7 @@ Key pillars:
 2. **Repacked MMQ GEMM for prefill** - 2D-tiled dp4a GEMM consuming repacked planes directly.
 3. **Multi-quant + broadcast + MoE extensions** - Q5_K/Q6_K/Q8_0/Q3_K in repacked path, 2D weight x 3D activation broadcast (GDN hybrid), 3D MUL_MAT_ID / expert-stack.
 4. **Concurrent-decode batching** - batched `ncols` matvecs and MoE per-token loops so 2-8 slots scale.
-5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, per-op profiler, ssm-conv / async memcpy / FATTN fixes, Vega20 MMQ tuning.
+5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, per-op profiler, ssm-conv / async memcpy / FATTN mask / HIP graph kernel guard / `J_max` padding fixes, Vega20 MMQ tuning (`Q6_K` `I=64 occ2`), native `q8_0` FATTN tile (shadow skip, `GGML_CUDA_FATTN_PATH`).
 
 ---
 
@@ -85,9 +85,12 @@ Key pillars:
 | 25 | `ca6deda1a` | 2026-09-11 | `ggml/cuda: add GCN vectorized fused RMSNorm+MUL for gfx906` | Perf / Fusion | fork-original |
 | 26 | `1bb6178d3` | 2026-09-11 | `docs: update FORK_TRACKING for fused RMSNorm+MUL ca6deda1a` | Docs | fork-original |
 | 27 | `80ad5c79` | 2026-09-11 | `ggml/cuda: fix Vega20 Q2_0 MMQ config, graph Global capture, test filter` | Fix / Testing | fork-original |
-| 28 | `HEAD` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
+| 28 | `b744f2377` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
+| 29 | `41ab374ac` | 2026-09-11 | `docs: finalize FORK_TRACKING for Vega fix` | Docs | fork-original |
+| 30 | `9b984f6f8` | 2026-09-13 | `ggml/cuda: GCN native q8_0 FATTN tile, FATTN mask fix, HIP graph kernel guard, MMQ padding` | Perf / Fix / FATTN+MMQ+Graph | port from `milpster/gfx906-llama-cpp` |
+| 31 | `HEAD` | 2026-09-13 | `docs: update FORK_TRACKING for GCN native FATTN 9b984f6f8` | Docs | fork-original |
 
-> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `1bb6178d3` includes merged `ca6deda1a`; `HEAD` adds 1 fix on top).
+> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `41ab374ac` at 29 commits; `HEAD` adds GCN native FATTN `9b984f6f8` + docs sync).
 
 ---
 
@@ -97,15 +100,20 @@ Key pillars:
   git diff --stat origin/master..HEAD
 
    .gitignore                              |   10 +
-   FORK_TRACKING.md                        |  395 +++++
+   FORK_TRACKING.md                        |  440 +++++
    build-llamacpp-rocm.sh                  |   27 +
    ggml/src/ggml-cuda/add-id.cu            |  117 +-
-   ggml/src/ggml-cuda/common.cuh           |  133 +-
+   ggml/src/ggml-cuda/common.cuh           |  143 +-
+   ggml/src/ggml-cuda/fattn-common.cuh     |   93 ++
    ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
+   ggml/src/ggml-cuda/fattn-tile.cuh       |  330 +++-
+   ggml/src/ggml-cuda/fattn-vec.cuh        |    6 +-
+   ggml/src/ggml-cuda/fattn.cu             |   63 +
    ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
-   ggml/src/ggml-cuda/ggml-cuda.cu         |  212 ++-
+   ggml/src/ggml-cuda/ggml-cuda.cu         |  264 +++-
    ggml/src/ggml-cuda/mmq-config-vega.cuh  |  282 ++++
-   ggml/src/ggml-cuda/mmq.cuh              |   10 +-
+   ggml/src/ggml-cuda/mmq.cu               |   13 +-
+   ggml/src/ggml-cuda/mmq.cuh              |   19 +-
    ggml/src/ggml-cuda/norm.cu              |  164 ++
    ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
    ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
@@ -115,7 +123,7 @@ Key pillars:
    ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
    src/llama-model.cpp                     |   10 +-
    tests/test-backend-ops.cpp              |    4 +-
-   19 files changed, 4307 insertions(+), 79 deletions(-)
+   24 files changed, 4912 insertions(+), 95 deletions(-)
   ```
 
 ### What each file does
@@ -124,19 +132,24 @@ Key pillars:
 |------|-------|--------------|
 | `ggml/src/ggml-cuda/repack-gcn.cu` | +2526 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery. ~90% of fork delta. |
 | `ggml/src/ggml-cuda/repack-gcn.cuh` | +57 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
-| `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128`, `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +212/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture for repack alloc. |
-| `ggml/src/ggml-cuda/common.cuh` | +132/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`. |
+| `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128` (`Q6_K I=64 occ2` after `9b984f6f8`), `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +264/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`9b984f6f8`). |
+| `ggml/src/ggml-cuda/common.cuh` | +143/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`, `cuda_graph` `kernel_funcs` + `unstable_disabled` (`9b984f6f8`). |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`ca6deda1a`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
 | `ggml/src/ggml-cuda/rope.cu` | +10 | `GCN` `__sincosf`+`__logf` in `rope_yarn` (vs `cosf+sinf`). |
 | `ggml/src/ggml-cuda/vecdotq.cuh` | +59 | `GCN` `memcpy` `b1/b2_fast`, `v_perm` `MXFP4` `8-entry`, `GGML_GCN_VEC_DOT_MXFP4` `Q8_0` fast. |
-| `ggml/src/ggml-cuda/mmq.cuh` | +8/-2 | Vega `MMQ` `GCN`/`__gfx906__` dispatch. |
+| `ggml/src/ggml-cuda/mmq.cuh` | +19/-2 | Vega `MMQ` `GCN`/`__gfx906__` dispatch; `J_max` fallback padding (`9b984f6f8`). |
 | `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | +17/-1 | Clamps `FATTN` `nstages=1` `occupancy=1` for `GCN` `64KB LDS`. |
+| `ggml/src/ggml-cuda/fattn-common.cuh` | +93 | `GGML_USE_HIP` `FATTN` auto native decision (`GGML_CUDA_FATTN_PATH`) + per-device `free_mem` probe (`9b984f6f8`). |
+| `ggml/src/ggml-cuda/fattn-tile.cuh` | +330/-2 | GCN native `q8_0` `half2/float` loaders, SW-pipelined `KQ` prefetch, 16-wide narrow tile + occupancy-tuned 256 config (`9b984f6f8`). |
+| `ggml/src/ggml-cuda/fattn-vec.cuh` | +6/-1 | Mask stride `nb31/2` fix for sequence-split `ne11` slice vs full mask rows (`9b984f6f8`). |
+| `ggml/src/ggml-cuda/fattn.cu` | +63 | GCN native `q8_0`/`f16+q8_0` predicates + alloc skip + `VEC` vs `TILE` routing for quantized KV (`9b984f6f8`). |
 | `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64×64`. |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
+| `ggml/src/ggml-cuda/mmq.cu` | +13 | NVFP4 `y_scale` + `ids_dst` `+J_max` / `+128` padding for `J`-wide overread (`9b984f6f8`). |
 | `build-llamacpp-rocm.sh` | +27 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` `REPACK` isolation. |
-| `FORK_TRACKING.md` | +395 (new) | This doc. |
+| `FORK_TRACKING.md` | +440 (new) | This doc. |
 | `.gitignore` | +10 | `results.*` `rocprof` traces + `build-llamacpp-rocm.sh`. |
 | `src/llama-model.cpp` | +6/-4 | `make_gpu_buft_list` `extra_bufts` precedence + 2D→3D broadcast. |
 | `tests/test-backend-ops.cpp` | +4/-2 | Substring `matches_filter` for `-o MUL_MAT(type_a=q4_K` partial (was exact-only -> 0 tests). |
@@ -249,6 +262,18 @@ Key pillars:
 - **Change (filter):** Allow substring `op_full_name.find(op_filter)!=npos` (and `op_name.find` for bare) `tests/test-backend-ops.cpp:1327`. Now `-o "MUL_MAT(type_a=q4_K"` -> `64/64` `q4_K`, `-p "q4_K"` also `64/64`; `-p "q2_0"` `47/47`, `q5_K` `29/29`, `q6_K` `13/13` verified on `ROCm0`. Keep `-o MUL_MAT` `1288/1288` green.
 - **Files:** `ggml/src/ggml-cuda/mmq-config-vega.cuh:23`, `ggml/src/ggml-cuda/ggml-cuda.cu:4595`, `tests/test-backend-ops.cpp:1327`
 
+### 21. `9b984f6f8` - GCN native q8_0 FATTN tile, FATTN mask fix, HIP graph kernel guard, MMQ padding (ported from `milpster/gfx906-llama-cpp`)
+- **Source:** Ported from `https://github.com/milpster/gfx906-llama-cpp` (`d14628d04` `q8_0-native`, `eaca6d43` `mixed F16+q8_0`, `7cfc00904` dispatch, `923a9661d` wip, `42fc61855` `fattn-vec`+graph, `cd97aeae0` `Q6_K I=64 occ2`, `469de3c3d` `MMQ OOB`, `91259ac30` probe). Adapted to `311d4211b` base, `GGML_USE_HIP` `GCN`-only.
+- **Why (FATTN native):** `fattn.cu` quantized KV paths materialize `f16` shadow (one full-KV layer) -> > 1 GiB at 40k ctx; GCN `gfx906` tile kernel can dequantize `q8_0` in-kernel (loads once per block vs `VEC` once per query row), but needed separate code paths for `K_q8/V_q8` and memory-aware selection.
+- **Change (FATTN native):** Add `ggml/src/ggml-cuda/fattn-common.cuh:6` auto native decision (`GGML_CUDA_FATTN_PATH=auto|force_convert|force_native`, `20%` free-mem headroom probe `ggml_cuda_fattn_auto_native`, per-device `decisions` cache re-checked when KV grows). Add `fattn.cu:479` predicates `ggml_cuda_fattn_tile_q8_0_native` / `tile_v_q8_0_native` (`GGML_TYPE_Q8_0`/`F16+Q8_0`, `DKQ==DV <=256`, `Q->ne[1]>2`) and `ggml_cuda_fattn_tile_get_config_amd` occupancy `3` for `256/256/16` (LDS 17.9 KB/wg). Add `fattn-tile.cuh:6` `load_tile_q8_0` (`half2/float` variants, 16 `ushort` -> `int8*d` dequant), SW-pipelined `flash_attn_tile_iter_KQ` prefetch hiding 31% LDS wait (bit-identical), `flash_attn_tile` `k_q8_0/v_q8_0` templated, `launch_fattn_tile_vega_native` helper and `launch_fattn_tile_switch_ncols1` 16-wide narrow tile for `Q<=16` verify batches + shadow skip `Q->ne[1]>2` aligned with `fattn.cu` alloc `need_f16` skip.
+- **Why (mask):** `fattn-vec.cuh:57` mask stride used `ne11` (KV slice length) but sequence-split `fattn` keeps full-width mask rows -> wrong `maskh` offset at deep KV leading to NaN/mis-rank.
+- **Change (mask):** Use `nb31 / sizeof(half)` as `s31` row stride (`fattn-vec.cuh:111`), `maskh[j*s31 + i_KQ]` vs `j*ne11`.
+- **Why (graph):** `hipGraphExecUpdate` applies kernel-function change without validating `launch_bounds`; `MUL_MAT_ID` crossing `quantize_mmq_q8_1<128>` vs `quantize_q8_1<32>` threshold leaves exec with `128` block dims over new `32` bounds -> UB at replay. Also spec-decode churn prevents amortization.
+- **Change (graph):** Add `ggml/src/ggml-cuda/common.cuh:1411` `kernel_funcs` vector + `n_prop_checks/n_prop_resets/unstable_disabled` and `is_enabled` gate. Add `ggml-cuda.cu:2676` `ggml_cuda_graph_update_executable` HIP path: enumerate `hipGraphGetNodes` -> `hipKernelNodeParams.func`, compare vs `kernel_funcs`, `GraphExecDestroy+Instantiate` on change (debug log), else `hipGraphExecUpdate` with fallback instantiate on failure; `#else` keeps CUDA path. Pointer-only updates when function set stable stay cheap.
+- **Why (MMQ):** `mmq-config-vega.cuh` `Q6_K I=128 occ1` left resident waves idle at deep KV; `mmq.cu` `NVFP4` `y_scale` and `ids_dst` lacked tail padding for `J`-wide stream-k fixup reading past valid columns -> OOB.
+- **Change (MMQ):** `mmq-config-vega.cuh:5` retune `Q6_K` 11 `CASE` rows to `256,2,64,J` (occ2) vs `256,1,128` (`+4.2%` PP `E115`, hides latency without VGPR spill). `mmq.cu:138` pad `src1_scale` `+128`, `mmq.cu:182` hoist `J_max = get_J_max(...)` then `ids_dst` `ne_get_rows+J_max`, `src1_q8_1` uses `J_max`, `NVFP4` `+128`. `mmq.cuh:377` `get_J_max` fallback: if no `J<=ne11` valid, return smallest valid `J` (8..128) for padding calc instead of `0`.
+- **Files:** `ggml/src/ggml-cuda/fattn-common.cuh:6`, `ggml/src/ggml-cuda/fattn-tile.cuh:6`, `ggml/src/ggml-cuda/fattn-vec.cuh:111`, `ggml/src/ggml-cuda/fattn.cu:479`, `ggml/src/ggml-cuda/common.cuh:1411`, `ggml/src/ggml-cuda/ggml-cuda.cu:2676`, `ggml/src/ggml-cuda/mmq-config-vega.cuh:5`, `ggml/src/ggml-cuda/mmq.cu:138`, `ggml/src/ggml-cuda/mmq.cuh:377`
+
 ---
 
 ## Correctness Notes
@@ -256,8 +281,8 @@ Key pillars:
 - All repacked matvec/MMQ variants validated via `wikitext PPL` vs GEMM/canonical within noise (tokens in commit logs).
 - `ub=1 PPL` checks: Q5_K/Q6_K, Q8_0 (5.07 vs 5.12), MoE ID paths, FATTN clamp (no PPL regression cited; LDS correctness).
 - `n_tokens/ne11==1` paths collapse to original launch -> single-stream byte-unchanged for concurrent-decode batching commits.
-- Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`.
-- `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage.
+- Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`, `GGML_CUDA_FATTN_PATH` (`auto`/`force_convert`/`force_native` for `9b984f6f8` native `q8_0` tile).
+- `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage. `9b984f6f8` adds `mask s31` fix, `graph kernel guard` (MUL_MAT_ID quantize swap), `MMQ` `J_max`/`NVFP4` padding — no PPL delta, graph stable on spec-decode fan-out.
 
 ---
 
@@ -272,6 +297,7 @@ Key pillars:
 | `REPACK_TRACE=1` | unset | Log `mul_mat` dispatch shapes |
 | `REPACK_NOFOLD=1` | unset | Disable `ssm_out` `ne12` fold |
 | `GFXPROF=1` | unset | HIP-events per-op profiler |
+| `GGML_CUDA_FATTN_PATH=auto\|force_convert\|force_native` | `auto` | FATTN quantized-KV path selector (`9b984f6f8`): `auto` probes free mem vs `f16` shadow (20% headroom) per device, `force_*` overrides for bench. |
 | `GGML_CUDA_ALLREDUCE=internal\|nccl` | auto | Multi-GPU all-reduce backend choice |
 | `GPU_TARGETS=gfx906` | - | HIP compile target |
 
@@ -285,9 +311,13 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 |------|--------|-----------|
 | `ssm_conv_long_token_f32` OOB fix | Upstream bug (#20128), cherry-picked here; should be PR'd if not already | Check `upstream/master` - if missing, open PR with `d08832721` diff |
 | `ggml_cuda_set_device` fix | Upstream #21140/#18313, already merged upstream via other PRs - verify not needed after rebase | Drop on next merge-base bump if upstream contains it |
+| `FATTN` mask `s31` fix | Upstream bug (mask stride vs sequence-split slice), fixed here `9b984f6f8` | PR upstream if still missing - see `fattn-vec.cuh:111` |
+| `MUL_MAT` `J_max`/`NVFP4` padding | Upstream bug (stream-k tail overread), fixed here `9b984f6f8` | PR upstream - `mmq.cu:138`/`mmq.cuh:377` |
+| `HIP` graph `hipGraphExecUpdate` kernel guard | HIP bug (launch-bounds not validated on func change) | Keep; consider upstreaming `common.cuh:1411` + `ggml-cuda.cu:2676` |
 | Repack buffer type | Fork-only; invasive (~2.5k LOC). Upstreaming would need feature-flag review | Keep fork-local, rebase-friendly, avoid touching hot paths when gated off |
 | FATTN GCN clamp | Fork-only; correctness on 64KB LDS | Validate against upstream FATTN changes at each rebase |
-| Vega20 MMQ table | Derived from RDNA2 occupancy 1; not upstream | Keep; upstream MMQ tables live in `mmq.cuh` and change often - rebase conflict expected |
+| FATTN GCN native `q8_0` tile | Fork-only; GCN 64KB LDS compact vs `f16` shadow | Keep; `GGML_USE_HIP` gated, validated via `ggml_cuda_fattn_use_native_tile` probe |
+| Vega20 MMQ table | Derived from RDNA2 occupancy 1; `Q6_K I=64 occ2` after `9b984f6f8` (`+4.2%` PP) | Keep; upstream MMQ tables live in `mmq.cuh` and change often - rebase conflict expected |
 | DPP warp reductions | GCN-only `#ifdef`; no CDNA/RDNA impact | Keep; re-check if upstream refactors `common.cuh` reductions |
 
 ---
@@ -304,10 +334,10 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
    git checkout gfx906/mi50-optimization
    git rebase origin/master   # or `git rebase upstream/master` then `git push --force-with-lease origin gfx906/mi50-optimization`
    ```
-   Expected conflicts: `ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh`, `mmq.cuh`, `fattn-mma-f16.cuh`, `src/llama-model.cpp`.
-3. Verify no silent behavior change when repack is off (`GGML_CUDA_REPACK=0` PPL vs upstream).
-4. Bump **Base / merge-base** and **Commits ahead** in this doc, and move commit `aa3c43261` into the main table after it lands locally.
-5. Update **File-level Impact** (`git diff --shortstat origin/master..HEAD`) and this checklist if upstream adds new files (e.g., `llama-model.cpp` graph changes).
+    Expected conflicts: `ggml/src/ggml-cuda/ggml-cuda.cu`, `common.cuh`, `mmq.cuh`, `fattn-mma-f16.cuh`, `fattn-tile.cuh`, `fattn-common.cuh`, `fattn-vec.cuh`, `src/llama-model.cpp`.
+3. Verify no silent behavior change when repack is off (`GGML_CUDA_REPACK=0` PPL vs upstream) and when `GGML_CUDA_FATTN_PATH=force_convert` matches non-native path.
+4. Bump **Base / merge-base** and **Commits ahead** in this doc.
+5. Update **File-level Impact** (`git diff --shortstat origin/master..HEAD`) and this checklist if upstream adds new files (e.g., `fattn.cu` tile changes).
 
 ---
 
@@ -316,8 +346,8 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 ```
 upstream/master (ggml-org)  ──────────────────────►  311d4211b ──► ... (new upstream commits)
 origin/master (this repo)      ──────────────────────►  311d4211b  (synced, no fork commits)
-origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 26 commits ──► 1bb6178d3 (published HEAD, includes fused RMSNorm)
-local gfx906/mi50-optimization   ────────── 311d4211b ──► 28 commits ──► a0b09660 (Vega fix + docs sync, 2 ahead of origin)
+origin/gfx906/mi50-optimization  ────────── 311d4211b ──► 29 commits ──► 41ab374ac (published HEAD, Vega fix + docs)
+local gfx906/mi50-optimization   ────────── 311d4211b ──► 31 commits ──► HEAD (GCN native FATTN 9b984f6f8 + docs sync, 2 ahead of origin)
 ```
 
 ---
@@ -325,7 +355,8 @@ local gfx906/mi50-optimization   ────────── 311d4211b ──
 ## Links & References
 
 - Upstream issues/PRs cited: `#20024`, `#20128`, `#21140`, `#21383`, `#28330`, `#28667`, s390x repack.
-- Related files: `ggml/src/ggml-cuda/repack-gcn.cu:1`, `ggml/src/ggml-cuda/repack-gcn.cuh:1`, `ggml/src/ggml-cuda/mmq-config-vega.cuh:1`, `ggml/src/ggml-cuda/common.cuh:452`, `ggml/src/ggml-cuda/ggml-cuda.cu:121`, `ggml/src/ggml-cuda/solve_tri.cu:1`, `ggml/src/ggml-cuda/ssm-conv.cu:1`, `ggml/src/ggml-cuda/fattn-mma-f16.cuh:230`, `build-llamacpp-rocm.sh:1`.
+- Ported from: `https://github.com/milpster/gfx906-llama-cpp` (`d14628d04` `q8_0-native`, `eaca6d43` `mixed`, `7cfc00904` dispatch, `923a9661d` wip, `42fc61855` `fattn-vec`+graph, `cd97aeae0` `Q6_K`, `469de3c3d` `MMQ OOB`, `91259ac30` probe) -> local `9b984f6f8`.
+- Related files: `ggml/src/ggml-cuda/repack-gcn.cu:1`, `ggml/src/ggml-cuda/repack-gcn.cuh:1`, `ggml/src/ggml-cuda/mmq-config-vega.cuh:1`, `ggml/src/ggml-cuda/common.cuh:452,1411`, `ggml/src/ggml-cuda/ggml-cuda.cu:121,2676`, `ggml/src/ggml-cuda/solve_tri.cu:1`, `ggml/src/ggml-cuda/ssm-conv.cu:1`, `ggml/src/ggml-cuda/fattn-mma-f16.cuh:230`, `ggml/src/ggml-cuda/fattn-common.cuh:6`, `ggml/src/ggml-cuda/fattn-tile.cuh:6`, `ggml/src/ggml-cuda/fattn-vec.cuh:111`, `ggml/src/ggml-cuda/fattn.cu:479`, `ggml/src/ggml-cuda/mmq.cu:138`, `ggml/src/ggml-cuda/mmq.cuh:377`, `build-llamacpp-rocm.sh:1`.
 
 ---
 
@@ -383,6 +414,19 @@ Source: local `gfx906/mi50-optimization` `ca6deda1a` — fuses the `3.6us` `rms_
 With `ca6deda1a` fused `RMSNorm+MUL` (`-ngl 99 -p512 -n128`):
 | `Qwen3.5-0.8B BF16` (752M) | `pp512 2995.15±121.6 tg 167.51±0.55` baseline `f51aa0ab2` | `pp 893-902 tg 164-166` with `F16/BF16` `nsp*64` repack (`GGML_CUDA_REPACK_F16=1`) | `pp -70%` — `rocBLAS Hgemm` already optimal, `q8` quant overhead, reverted gated `default-off` |
 | `Merged 1.9B BF16` (qwen35 2B) | `pp 1174 tg 93.2` baseline | `pp 1179 tg 93.6` with `ca6deda1a` fused | `+0.4%` neutral within variance (`test-backend-ops -o RMS_NORM 51/51 OK`) |
+
+## GCN Native FATTN q8_0 Tile + HIP Graph + MMQ (2026-09-13, `9b984f6f8`, ported from `milpster/gfx906-llama-cpp`)
+
+Source: `milpster/gfx906-llama-cpp` (`d14628d04`, `eaca6d43`, `7cfc00904`, `923a9661d`, `42fc61855`, `cd97aeae0`, `469de3c3d`, `91259ac30` + SW pipeline) — native `q8_0` FATTN tile (shadow skip), HIP graph kernel guard, MMQ padding + `Q6_K` retune. Ported to `gfx906/mi50-optimization` `9b984f6f8`.
+
+| # | Area | File | Change | Status |
+|---|------|------|--------|--------|
+| 29 | `FATTN` native `q8_0` tile | `fattn-common.cuh:6` `fattn-tile.cuh:6` `fattn.cu:479` | `q8_0` `K/V` (`half2/float` loaders, 16 `ushort` dequant), `q8_0`+`f16` mixed, auto `free_mem` probe (20% headroom) per device `GGML_CUDA_FATTN_PATH=auto/force_*`, 16-wide narrow tile for `Q<=16` verify, `256/256/16` occ `3` (17.9 KB LDS). `VEC` vs `TILE` split: `VEC` for non-GCN or small-KV, `TILE` for GCN deep-KV. | Built `build-llamacpp-rocm.sh` ok, no shadow alloc when native |
+| 30 | `FATTN` SW pipeline + mask | `fattn-tile.cuh:293` `fattn-vec.cuh:111` | Pipelined `Q/K` `K_k[2]/Q_k[2]` double-buffer hiding 31% LDS wait, `mask s31=nb31/2` fix for sequence-split slice vs full rows. | Correctness fix |
+| 31 | `HIP` graph kernel guard | `common.cuh:1411` `ggml-cuda.cu:2676` | `kernel_funcs` vector + `unstable_disabled` gate; `hipGraphExecUpdate` compares `func` sets, `Destroy+Instantiate` on change, fallback on failure. Fixes `MUL_MAT_ID` `128` vs `32` bounds UB. | Validated on spec-decode churn |
+| 32 | `MMQ` Vega `Q6_K` + padding | `mmq-config-vega.cuh:5` `mmq.cu:138` `mmq.cuh:377` | `Q6_K` `I=64 occ2` (was `128/1`) `+4.2%` PP, `src1_scale +128` / `ids_dst +J_max` / `src1_q8_1 J_max` for `J`-wide tail overread, `J_max` fallback to smallest `J` (8..128). | Fixes `NVFP4`/`ids` OOB |
+
+`fattn` native path is `GGML_USE_HIP` `GCN`-only (`#if defined(GGML_USE_HIP)`) so no `CDNA/RDNA/NV` impact. `Q->ne[1]>2` guard keeps small-Q prompt tails/MTP verify on `f16` convert (shares shadow sizing in `fattn.cu:738` and dispatch `fattn-tile.cuh:1450` so they cannot disagree). Bench: default `auto` keeps `f16` convert while shadow fits (small ctx), switches to compact native at large `kv_len` where native tile's once-per-block K/V reuse wins.
 
 ---
 
