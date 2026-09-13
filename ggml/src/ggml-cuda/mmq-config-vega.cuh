@@ -5,8 +5,8 @@
 // workgroup, while gfx906 has 64 KB LDS shared per CU across all resident
 // workgroups. With MMQ tile I=128 the per-block shared memory footprint already
 // consumes most of the CU budget, so occupancy is capped at 1 block per CU
-// instead of RDNA2's 2. The compiler hint in __launch_bounds__ is set
-// accordingly so register allocation is not artificially constrained.
+// instead of RDNA2's 2 (Q6_K I=64 occ2 proven +4.2% PP E115, hides latency
+// without VGPR spill, so Q6_K uses 64/2 while others stay 128/1).
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_vega(ggml_type type, int J, bool fallback) {
     CASE(GGML_TYPE_Q1_0, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
     CASE(GGML_TYPE_Q1_0, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, false, true);
@@ -142,17 +142,17 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q5_K, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
     CASE(GGML_TYPE_Q5_K, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
 
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
-    CASE(GGML_TYPE_Q6_K, 256, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,   8, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  24, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  40, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
 
 // ---------------------------------------------------------------------------------------------
 
