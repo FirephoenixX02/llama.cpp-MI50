@@ -265,7 +265,7 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
 
 static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8) {
 #ifdef GGML_USE_HIP
-<#if defined(GCN) || defined(__gfx906__)
+#if defined(GCN) || defined(__gfx906__)
     return ggml_cuda_mmq_get_config_vega(type, J, fallback);
 #elif defined(CDNA)
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
