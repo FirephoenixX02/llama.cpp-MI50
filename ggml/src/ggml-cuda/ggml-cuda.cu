@@ -4757,6 +4757,41 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+#if defined(GGML_USE_HIP)
+    // F32 single-column matvecs sharing their x (grouped by graph_optimize)
+    if (ggml_cuda_f32_multi_ok(node) && ggml_cuda_info().devices[cuda_ctx->device].warp_size == 64) {
+        int n = 1;
+        while (n < 3 && i + n < cgraph->n_nodes && ggml_cuda_f32_multi_ok(cgraph->nodes[i + n]) &&
+                cgraph->nodes[i + n]->src[1] == node->src[1] && (cgraph->nodes[i + n]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            n++;
+        }
+        bool aligned = (uintptr_t) node->src[1]->data % 16 == 0;
+        for (int k = 0; k < n; k++) {
+            aligned &= (uintptr_t) cgraph->nodes[i + k]->src[0]->data % 16 == 0;
+        }
+        if (n >= 2 && aligned) {
+            f32_multi_args args = {};
+            uint32_t waves = 0;
+            for (int k = 0; k < 3; k++) {
+                args.start[k] = waves;
+                if (k < n) {
+                    const ggml_tensor * mm = cgraph->nodes[i + k];
+                    args.A[k]    = (const float *) mm->src[0]->data;
+                    args.y[k]    = (float *) mm->data;
+                    args.lda[k]  = mm->src[0]->nb[1] / sizeof(float);
+                    args.rows[k] = (uint32_t) mm->src[0]->ne[1];
+                    waves += args.rows[k];
+                } else {
+                    args.start[k] = UINT32_MAX;
+                }
+            }
+            gcn_f32_matvec_rows_multi<<<(waves + 3) / 4, 256, 0, cuda_ctx->stream()>>>(args, (const float *) node->src[1]->data);
+            CUDA_CHECK(cudaGetLastError());
+            return n - 1;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     return 0;
 }
 
