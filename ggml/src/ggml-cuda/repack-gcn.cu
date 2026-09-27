@@ -3196,8 +3196,11 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_flat_nc(
 }
 
 // Dense Q8_0 with a few activation columns (speculative verify, 2-8 tokens): one wave per row, each
-// weight half-sub-block is loaded once and dotted with every column.
-template <int NC>
+// weight half-sub-block is loaded once and dotted with every column. The tiled MMQ GEMM costs
+// ~135 us per call at N = 2 against ~30 us here.
+// ITERS > 0: compile-time trip count (n_half <= ITERS*64); every weight load of a lane is
+// issued before the dot products, as in mul_mat_vec_q8_0_repacked_rowu
+template <int NC, int ITERS>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1, const uint32_t x_stride) {
@@ -3218,6 +3221,35 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_nc(
         acc[c] = 0.0f;
     }
     const uint32_t n_half = n_blocks * 2;
+    if constexpr (ITERS > 0) {
+        int4     w[ITERS];
+        uint16_t db[ITERS];
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            const uint32_t sb = (hb < n_half ? hb : 0) >> 1, half = hb & 1;
+            w[j]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+            db[j] = d_plane[(size_t) row * nsp + sb];
+        }
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            if (hb >= n_half) {
+                break;
+            }
+            const uint32_t sb = hb >> 1, half = hb & 1;
+            const float    dw = __half2float(*reinterpret_cast<const __half *>(&db[j]));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+                const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+                int idot = 0;
+                idot = ggml_cuda_dp4a(w[j].x, a.x, idot); idot = ggml_cuda_dp4a(w[j].y, a.y, idot);
+                idot = ggml_cuda_dp4a(w[j].z, a.z, idot); idot = ggml_cuda_dp4a(w[j].w, a.w, idot);
+                acc[c] += dw * __low2float(xb->ds) * (float) idot;
+            }
+        }
+    } else
     for (uint32_t hb = lane; hb < n_half; hb += 64) {
         const uint32_t sb   = hb >> 1;
         const uint32_t half = hb & 1;
@@ -3262,7 +3294,15 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 const int64_t R = 256 / nb;
                 mul_mat_vec_q8_0_repacked_flat_nc<NC><<<(ne01 + R - 1) / R, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
             } else {
-                mul_mat_vec_q8_0_repacked_nc<NC><<<(ne01 + 3) / 4, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride);
+                static const bool no_ncu = getenv("GGML_CUDA_NO_Q8_NCU") != nullptr;
+                const int64_t n_it = no_ncu ? 0 : (2*nb + 63) / 64;
+                const dim3 grid((ne01 + 3) / 4);
+                switch (n_it) {
+                    case 3:  mul_mat_vec_q8_0_repacked_nc<NC, 3><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
+                    case 4:  mul_mat_vec_q8_0_repacked_nc<NC, 4><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
+                    case 6:  mul_mat_vec_q8_0_repacked_nc<NC, 6><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
+                    default: mul_mat_vec_q8_0_repacked_nc<NC, 0><<<grid, 256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride); break;
+                }
             }
         };
         switch (ne11) {
