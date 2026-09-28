@@ -1612,6 +1612,9 @@ struct ggml_cuda_repack_route_cache {
         const char * lo = nullptr, * hi = nullptr;
         char       * buf = nullptr;
         size_t       cap = 0;
+        // of a contiguous tensor, valid for single-column consumers reading <= flat_n values
+        const ggml_tensor * producer = nullptr;
+        int64_t             flat_n   = 0;
     };
     static constexpr int N_XQ = 4;
     xq_entry xqc[N_XQ];
