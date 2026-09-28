@@ -3272,6 +3272,92 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_nc(
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// The grouped launch (q8_multi_args) with several activation columns: mul_mat_vec_q8_0_repacked_nc per row,
+// the matrix chosen per wave
+template <int NC, int ITERS>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_multi_nc(
+        const q8_multi_args args, const block_q8_1 * __restrict__ xq, const uint32_t ne0, const uint32_t x_stride) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    // the rows of the grouped matrices sit back to back; each wave resolves its own matrix
+    const uint32_t grow = blockIdx.x * 4 + threadIdx.x / 64;
+    const int      t    = grow >= args.start[2] ? 2 : (grow >= args.start[1] ? 1 : 0);
+    const uint32_t row  = grow - args.start[t];
+    const uint32_t ne1  = args.ne1[t];
+    if (row >= ne1) {
+        return;
+    }
+    const uint8_t * __restrict__ wbase = args.w[t];
+    float * __restrict__ y = args.y[t];
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t nsp = ((n_blocks & (n_blocks - 1u)) == 0u) ? (n_blocks + 1u) : n_blocks;
+    const int      * qs_int  = reinterpret_cast<const int *>(wbase);
+    const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(wbase + (size_t) ne1 * nsp * 32);
+    const int lane = threadIdx.x % 64;
+
+    float acc[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        acc[c] = 0.0f;
+    }
+    const uint32_t n_half = n_blocks * 2;
+    if constexpr (ITERS > 0) {
+        int4     w[ITERS];
+        uint16_t db[ITERS];
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            const uint32_t sb = (hb < n_half ? hb : 0) >> 1, half = hb & 1;
+            w[j]  = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+            db[j] = d_plane[(size_t) row * nsp + sb];
+        }
+#pragma unroll
+        for (int j = 0; j < ITERS; ++j) {
+            const uint32_t hb = lane + j * 64;
+            if (hb >= n_half) {
+                break;
+            }
+            const uint32_t sb = hb >> 1, half = hb & 1;
+            const float    dw = __half2float(*reinterpret_cast<const __half *>(&db[j]));
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+                const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+                int idot = 0;
+                idot = ggml_cuda_dp4a(w[j].x, a.x, idot); idot = ggml_cuda_dp4a(w[j].y, a.y, idot);
+                idot = ggml_cuda_dp4a(w[j].z, a.z, idot); idot = ggml_cuda_dp4a(w[j].w, a.w, idot);
+                acc[c] += dw * __low2float(xb->ds) * (float) idot;
+            }
+        }
+    } else
+    for (uint32_t hb = lane; hb < n_half; hb += 64) {
+        const uint32_t sb   = hb >> 1;
+        const uint32_t half = hb & 1;
+        const int4 w = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+        const uint16_t db = d_plane[(size_t) row * nsp + sb];
+        const float    dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+            const int4 a = *reinterpret_cast<const int4 *>(reinterpret_cast<const int *>(xb->qs) + half * 4);
+            int idot = 0;
+            idot = ggml_cuda_dp4a(w.x, a.x, idot); idot = ggml_cuda_dp4a(w.y, a.y, idot);
+            idot = ggml_cuda_dp4a(w.z, a.z, idot); idot = ggml_cuda_dp4a(w.w, a.w, idot);
+            acc[c] += dw * __low2float(xb->ds) * (float) idot;
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float v = warp_reduce_sum<64>(acc[c]);
+        if (lane == 0) {
+            y[(size_t) c * ne1 + row] = v;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(args, xq, ne0, x_stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
@@ -3534,6 +3620,55 @@ void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_
     }
 }
 
+static const ggml_tensor * repack_view_root(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    static const bool disabled = getenv("GGML_CUDA_NO_Q8_EMIT") != nullptr;
+    if (disabled || cgraph == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) ||
+            ggml_nelements(t) % QK8_1 != 0) {
+        return nullptr;
+    }
+    bool consumer = false;
+    for (int i = 0; i < cgraph->n_nodes && !consumer; i++) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op != GGML_OP_MUL_MAT || !n->src[0]->buffer || !ggml_backend_buft_is_cuda_repack(n->src[0]->buffer->buft)) {
+            continue;
+        }
+        const ggml_tensor * x = n->src[1];
+        // several columns read the flat blocks as [ne1][ne0/32], which is the consumer's layout only when
+        // ne0 needs no row padding
+        consumer = repack_view_root(x) == repack_view_root(t) && x->data == t->data && ggml_is_contiguous(x) &&
+            x->type == GGML_TYPE_F32 && x->ne[2] == 1 && x->ne[3] == 1 &&
+            (x->ne[1] == 1 || x->ne[0] % MATRIX_ROW_PADDING == 0) && x->ne[0]*x->ne[1] <= ggml_nelements(t);
+    }
+    bool capturing = false;
+    if (!consumer || !repack_route_cache_usable(ctx, ctx.stream(), &capturing)) {
+        return nullptr;
+    }
+    ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+    auto & e = rc.xqc[rc.xqc_next];
+    rc.xqc_next = (rc.xqc_next + 1) % ggml_cuda_repack_route_cache::N_XQ;
+    e.gen = 0;
+    const size_t bytes = ggml_nelements(t) / QK8_1 * sizeof(block_q8_1);
+    if (!repack_rc_reserve(rc, (void **) &e.buf, &e.cap, bytes, capturing)) {
+        return nullptr;
+    }
+    e.gen      = ctx.graph_gen;
+    e.data     = t->data;
+    memset(e.ne, 0, sizeof(e.ne));
+    memset(e.nb, 0, sizeof(e.nb));
+    e.lo       = (const char *) t->data;
+    e.hi       = e.lo + ggml_nbytes(t);
+    e.producer = t;
+    e.flat_n   = ggml_nelements(t);
+    return e.buf;
+}
+
 // Quantize src1 (F32, dim0 dense) to q8_1 as [ne3][ne2][ne1][ne10_padded/QK8_1]
 // blocks. On the main stream the result is cached per graph: gate/up and the
 // shared expert (or q/k/v) quantize the same activation. Entries die when any
@@ -3554,9 +3689,16 @@ static const block_q8_1 * repack_quantize_x(ggml_backend_cuda_context & ctx, con
         return (const block_q8_1 *) p;
     }
     ggml_cuda_repack_route_cache & rc = ctx.repack_rc;
+    // an emitted (flat) entry serves one column, or several when ne0 needs no row padding (then the flat
+    // blocks are exactly [ne1][ne10_padded/32])
+    const bool flat_ok = src1->ne[2] == 1 && src1->ne[3] == 1 && ggml_is_contiguous(src1) &&
+        (src1->ne[1] == 1 || ne10_padded == src1->ne[0]);
     for (auto & e : rc.xqc) {
-        if (e.gen == ctx.graph_gen && e.data == src1->data &&
-                memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+        if (e.gen != ctx.graph_gen || e.data != src1->data) {
+            continue;
+        }
+        if (e.flat_n > 0 ? (flat_ok && src1->ne[0]*src1->ne[1] <= e.flat_n) :
+                (memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0)) {
             return (const block_q8_1 *) e.buf;
         }
     }
@@ -4138,7 +4280,8 @@ bool ggml_cuda_repack_q8_multi_group(const ggml_tensor * mm) {
 bool ggml_cuda_repack_q8_multi_ok(const ggml_tensor * mm) {
     const ggml_tensor * x = mm->src[1];
     return ggml_cuda_repack_q8_multi_group(mm) &&
-        x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && ggml_is_contiguous(mm);
+        x->ne[1] >= 1 && x->ne[1] <= 16 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+        (x->ne[1] == 1 || ggml_is_contiguous(x)) && ggml_is_contiguous(mm);
 }
 
 void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n) {
@@ -4165,6 +4308,40 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
             args.start[i] = UINT32_MAX;
         }
     }
-    mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
+    const int64_t ne11 = src1->ne[1];
+    if (ne11 == 1) {
+        mul_mat_vec_q8_0_repacked_multi<<<rows, 64, 0, stream>>>(args, xq, (uint32_t) ne00);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // several columns (speculative verify, several sequences): the nc kernel over the grouped rows
+    const int64_t x_stride = ne10_padded / QK8_1;
+    const int64_t n_it     = (2*(ne00/32) + 63) / 64;
+    const dim3 grid((rows + 3) / 4);
+    auto launch = [&](auto nc) {
+        constexpr int NC = decltype(nc)::value;
+        if (n_it == 3) {
+            mul_mat_vec_q8_0_repacked_multi_nc<NC, 3><<<grid, 256, 0, stream>>>(args, xq, (uint32_t) ne00, (uint32_t) x_stride);
+        } else {
+            mul_mat_vec_q8_0_repacked_multi_nc<NC, 0><<<grid, 256, 0, stream>>>(args, xq, (uint32_t) ne00, (uint32_t) x_stride);
+        }
+    };
+    switch (ne11) {
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        case 3:  launch(std::integral_constant<int, 3>{}); break;
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 5:  launch(std::integral_constant<int, 5>{}); break;
+        case 6:  launch(std::integral_constant<int, 6>{}); break;
+        case 7:  launch(std::integral_constant<int, 7>{}); break;
+        case 8:  launch(std::integral_constant<int, 8>{}); break;
+        case 9:  launch(std::integral_constant<int, 9>{}); break;
+        case 10: launch(std::integral_constant<int, 10>{}); break;
+        case 11: launch(std::integral_constant<int, 11>{}); break;
+        case 12: launch(std::integral_constant<int, 12>{}); break;
+        case 13: launch(std::integral_constant<int, 13>{}); break;
+        case 14: launch(std::integral_constant<int, 14>{}); break;
+        case 15: launch(std::integral_constant<int, 15>{}); break;
+        default: launch(std::integral_constant<int, 16>{}); break;
+    }
     CUDA_CHECK(cudaGetLastError());
 }
