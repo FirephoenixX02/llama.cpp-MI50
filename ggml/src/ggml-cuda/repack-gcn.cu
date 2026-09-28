@@ -3047,21 +3047,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     const block_q8_1 * xq_all = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
 
-    // LEVER 4: per-sequence decode fold. The GDN output projection (ssm_out)
-    // arrives as ne11==1 with ne12=n_seqs — the delta-net emits [d,1,n_seqs],
-    // so the loop below would issue n_seqs separate ne11=1 matvecs, each
-    // re-reading the full weight. The seq slices are contiguous (quantized
-    // blocks pack densely at x_stride; dst columns at ne01 when contiguous),
-    // so fold ne12 into the column batch: one ne11=ne12 call reuses the
-    // batched ncols kernel (same weight read feeds all seqs). Same weights for
-    // every slice (2D src0 broadcast), so this is exact.
-    static const int repack_nofold = getenv("REPACK_NOFOLD") ? atoi(getenv("REPACK_NOFOLD")) : 0;
-    if (!repack_nofold &&
-        ne13 == 1 && ne11 == 1 && ne12 >= 2 && ne12 <= 8 &&
-        dst->nb[2] == (size_t) ne01 * sizeof(float)) {
-        ggml_cuda_mul_mat_repacked_slice(ctx, src0, w,
-            xq_all, (float *) dst->data,
-            ne00, ne01, /*ne11=*/ne12, x_stride, stream);
+    // the weight is shared by every slice, and xq_all holds the slices as adjacent columns: when dst
+    // is contiguous too, run all of them as one matmul (GDN output with several sequences
+    // [K, 1, n_seq]; MTP eh_proj [K, n_hc, n_tokens] would otherwise launch once per token)
+    static const bool no_flat = getenv("GGML_CUDA_NO_REPACK_FLATTEN") != nullptr;
+    if (!no_flat && ne12 * ne13 > 1 &&
+        dst->nb[2] == (size_t) ne11 * dst->nb[1] && dst->nb[3] == (size_t) ne12 * dst->nb[2]) {
+        ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq_all, (float *) dst->data,
+            ne00, ne01, ne11 * ne12 * ne13, x_stride, stream);
         return;
     }
 
