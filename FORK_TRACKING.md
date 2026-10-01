@@ -10,10 +10,10 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `f3d2967a5` (2026-09-28) - rebase-test merge |
-| **Local branch** | `gfx906/mi50-optimization` at `4b78912e5` + furnace generic-opt ports (16 commits) |
+| **Local branch** | `gfx906/mi50-optimization` at `e33ef09de` + repack tiling ports (24 commits) |
 | **Base / merge-base** | `4364bf723` - `metal: support left and circular padding in GGML_OP_PAD` (#29561) |
 | **Base date** | 2026-09-28 |
-| **Commits ahead of base** | 81 on `HEAD` (65 rebased fork commits + 16 furnace ports, incl. 2 manual guards) |
+| **Commits ahead of base** | 105 on `HEAD` (65 rebased fork commits + 16 furnace generic opts + 24 furnace repack tiling) |
 | **Last doc update** | 2026-10-01 |
 | **Upstream `origin/master`** | `4364bf723` (mirrors ggml-org `master` at same date) |
 | **Donor** | `furnace/gfx906-perf` at `905021dba` (2026-09-30, sixvolts) - generic single-GPU opts ported, qwen4exp/MTP/multigpu deferred |
@@ -106,6 +106,29 @@ Key pillars:
 | 45 | `e4e2e78fb` | 2026-09-27 | `cuda: get_rows - pack short rows into one block` | Perf / GET_ROWS | port from furnace `596c95b54`, sixvolts + Claude Opus 5.5 |
 | 46 | `05f064f55` | 2026-09-27 | `cuda: HIP top-k radix select - parallel bin search` | Perf / TOPK | port from furnace `47e140b4d`, sixvolts + Claude Opus 5.5 |
 | 47 | `4b78912e5` | 2026-09-27 | `cuda: topk-moe - DPP lane moves in the argmax butterfly on GCN` | Perf / MoE | port from furnace `0a2860296`, sixvolts + Claude Opus 5.5 |
+| 48 | `d61203d88` | 2026-10-01 | `ggml/hip: Q5_1 repack for GCN` | Perf / Repack | manual port of furnace `4998a31c5`, sixvolts + Claude Opus 5.5, adapted to LEVER dispatch |
+| 49 | `2a571c46f` | 2026-10-01 | `ggml/hip: Q5_1 short-row seg matvec` | Perf / Repack | manual port of furnace `91c65edd7`, sixvolts + Claude Opus 5.5 |
+| 50 | `1179fbd10` | 2026-10-01 | `ggml/hip: Q8_0 short-row seg and splitk matvec` | Perf / Repack | manual port of furnace `5770fe67b`, sixvolts + Claude Opus 5.5 |
+| 51 | `51d411ae0` | 2026-10-01 | `ggml/hip: Q8_0 flat K320 and rowu K6144 plus GLU one-row wave` | Perf / Repack | manual port of furnace `09115fed0` + `c0070db50` + `a765d59d8`, sixvolts + Claude Opus 5.5 |
+| 52 | `ad17921b3` | 2026-10-01 | `ggml/hip: Q4_K MoE GLU 16-lane decode` | Perf / Repack | manual port of furnace `112246080`, sixvolts + Claude Opus 5.5 |
+| 53 | `049230eab` | 2026-09-23 | `ggml-hip: fold the Q5_K high bit into int8 at LDS staging in the repacked MMQ` | Perf / MMQ | port from furnace `783fee0db`, sixvolts + Claude Opus 5.5 |
+| 54 | `e27ae631a` | 2026-09-23 | `cuda: repack MMQ MoE - hoist ids gather, parallel tile->expert map, occupancy 4` | Perf / MMQ | port from furnace `6bed0852d`, sixvolts + Claude Opus 5.5 |
+| 55 | `a9aed2690` | 2026-09-23 | `cuda: repack MMQ Q8_0 - b128 X/W LDS planes, K-tail skip, coalesced epilogue` | Perf / MMQ | port from furnace `efa372001`, sixvolts + Claude Opus 5.5 |
+| 56 | `c2c4b0b28` | 2026-09-23 | `cuda: repack MMQ Q4_K MoE - 1-wave 64x16 tile, 4x4 per-lane micro-tile` | Perf / MMQ | port from furnace `2d06ccf8e`, sixvolts + Claude Opus 5.5 |
+| 57 | `2a2c4f3b3` | 2026-09-23 | `cuda: repack MMQ Q4_K MoE - drop the GGML_CUDA_REPACK_Q4K_OLD A/B path` | Cleanup / MMQ | port from furnace `243742bf5`, sixvolts + Claude Opus 5.5 |
+| 58 | `7dae6b533` | 2026-09-23 | `cuda: repack MMQ Q8_0 dense - W register prefetch, occupancy 3` | Perf / MMQ | port from furnace `4d7f65477`, sixvolts + Claude Opus 5.5 |
+| 59 | `95fa59dde` | 2026-09-26 | `cuda: merge dense repacked Q8_0 matvecs that share their activation` | Perf / Batching | port from furnace `782a256af`, sixvolts + Claude Opus 5.5, quantize via local pattern |
+| 60 | `8bd47e709` | 2026-09-26 | `cuda: group sibling matvecs independent of the token count` | Perf / Batching | port from furnace `063188a8f`, sixvolts + Claude Opus 5.5 |
+| 61 | `8997f5cb7` | 2026-09-26 | `cuda: merge F32 single-column matvecs that share their input` | Perf / Batching | port from furnace `8a1434bd1`, sixvolts + Claude Opus 5.5, launch block only (grouping already in 60) |
+| 62 | `2036e6635` | 2026-10-01 | `ggml/hip: Q8_0 matvec for 2-8 columns` | Perf / Repack | manual port of furnace `5029cad4e`, sixvolts + Claude Opus 5.5, dispatched ahead of LEVERs |
+| 63 | `aa50007bb` | 2026-10-01 | `ggml/cuda: repack MUL_MAT_ID route and activation cache` | Perf / Cache | manual port of furnace `45f7f7eba`, sixvolts + Claude Opus 5.5, LEVER-2 loop kept |
+| 64 | `239cd9b02` | 2026-09-27 | `cuda: repacked MoE for 2-8 tokens through the per-slot decode kernels` | Perf / Batching | port from furnace `9d82e1845`, sixvolts + Claude Opus 5.5, LEVER-2 loop replaced by single-grid + expansion |
+| 65 | `af5c92439` | 2026-09-27 | `cuda: faster 2-8 token forwards (split-K / short-row Q8_0, MoE GLU, F32)` | Perf / Batching | port from furnace `eadd8281a`, sixvolts + Claude Opus 5.5, GLU adapted to local quantize |
+| 66 | `414deeaca` | 2026-09-27 | `cuda: small-batch paths up to 16 tokens` | Perf / Batching | port from furnace `acf92306c`, sixvolts + Claude Opus 5.5 |
+| 67 | `0c19bece7` | 2026-10-01 | `ggml/cuda: Q8_0 fused GLU and per-graph activation cache` | Perf / Fusion+Cache | manual port of furnace `8ac1bc756`, sixvolts + Claude Opus 5.5 |
+| 68 | `e25a81d81` | 2026-09-27 | `cuda: fold one-column broadcast slices into the Q8_0 nc matvec; nc load prefetch` | Perf / Repack | port from furnace `9791f13e8`, sixvolts + Claude Opus 5.5, broadcast-fold deferred (LEVER-4 kept) |
+| 69 | `df1b9bd41` | 2026-09-28 | `cuda: flatten contiguous src1 slices in repacked mul_mat` | Perf / Batching | port from furnace `8bb172726`, sixvolts + Claude Opus 5.5, supersedes LEVER-4 |
+| 70 | `e33ef09de` | 2026-09-28 | `cuda: single-token fusions for a few columns` | Perf / Fusion | port from furnace `533d05dca`, sixvolts + Claude Fable 5.1, hc_up kernel excluded (qwen4exp) |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`1d9cb8b46`, `60fac5340`) credit the furnace source commit in the body.
 >
@@ -480,8 +503,31 @@ Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf
 | 45 | `e4e2e78fb` | `596c95b54` | get_rows short-row packing (one block). | Ported |
 | 46 | `05f064f55` | `47e140b4d` | HIP top-k radix select with parallel bin search. | Ported |
 | 47 | `4b78912e5` | `0a2860296` | topk-moe DPP lane moves in argmax butterfly on GCN. | Ported |
+| 48 | `d61203d88` | `4998a31c5` | Q5_1 repack type + matvec/MMQ (opt-in). | Manual port, adapted to LEVER dispatch |
+| 49 | `2a571c46f` | `91c65edd7` | Q5_1 short-row seg matvec. | Manual port |
+| 50 | `1179fbd10` | `5770fe67b` | Q8_0 short-row seg + splitk matvec. | Manual port |
+| 51 | `51d411ae0` | `09115fed0`+`c0070db50`+`a765d59d8` | Q8_0 flat K320 + rowu K6144 + GLU one-row wave. | Manual port |
+| 52 | `ad17921b3` | `112246080` | Q4_K MoE GLU 16-lane decode. | Manual port |
+| 53 | `049230eab` | `783fee0db` | Q5_K high-bit LDS fold in MMQ. | Ported |
+| 54 | `e27ae631a` | `6bed0852d` | MMQ MoE ids hoist + parallel tile map, occ4. | Ported |
+| 55 | `a9aed2690` | `efa372001` | MMQ Q8_0 b128 planes + K-tail skip. | Ported |
+| 56 | `c2c4b0b28` | `2d06ccf8e` | MMQ Q4_K MoE 1-wave 64x16 tile. | Ported |
+| 57 | `2a2c4f3b3` | `243742bf5` | Drop Q4K_OLD A/B path. | Ported |
+| 58 | `7dae6b533` | `4d7f65477` | MMQ Q8_0 dense W prefetch, occ3. | Ported |
+| 59 | `95fa59dde` | `782a256af` | Merge dense Q8_0 sharing activation. | Ported, quantize via local pattern |
+| 60 | `8bd47e709` | `063188a8f` | Group sibling matvecs by kind. | Ported |
+| 61 | `8997f5cb7` | `8a1434bd1` | Merge F32 sharing input (launch only). | Ported subset |
+| 62 | `2036e6635` | `5029cad4e` | Q8_0 matvec for 2-8 columns. | Manual port, ahead of LEVERs |
+| 63 | `aa50007bb` | `45f7f7eba` | Route + activation cache, LEVER-2 kept. | Manual port |
+| 64 | `239cd9b02` | `9d82e1845` | MoE 2-8 tokens via single-grid slots. | Ported, replaces LEVER-2 loop |
+| 65 | `af5c92439` | `eadd8281a` | splitk_nc/flat_nc + GLU multi-token + F32. | Ported, GLU via local quantize |
+| 66 | `414deeaca` | `acf92306c` | Small-batch paths to 16 tokens. | Ported |
+| 67 | `0c19bece7` | `8ac1bc756` | Q8_0 fused GLU + xq cache + invalidate. | Manual port |
+| 68 | `e25a81d81` | `9791f13e8` | nc ITERS prefetch + dispatch. Fold deferred. | Ported subset |
+| 69 | `df1b9bd41` | `8bb172726` | Flatten slices, supersedes LEVER-4. | Ported, tests dropped |
+| 70 | `e33ef09de` | `533d05dca` | multi_nc + F32 multi-NC + emit cache. hc_up kernel excluded (qwen4exp). | Ported subset |
 
-Deferred: repack-`repack-gcn.cu` tiling (`Q5_1`, `Q8_0` short rows, `MMQ Q4_K/Q8_0`, `MUL_MAT_ID` cache, `2-8` token paths, `Q8_0`/F32 merges, `Q4_K` MoE GLU, `8ac1bc756` GLU) - donor base lacks local `LEVER` batching, needs manual port. qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A.
+Deferred: qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP` kernels incl. `38e622c66`, `82e94c50e`, `f042cc0fa`, `a3f17680d`, `601fa96fd`, `1363d53ba`, `c294e1588`, `8877ee890`, `314cab9ca`, `0b78e4d91`, `c2a356097`, `1353e6875`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A. `b3c18e502` skipped as redundant.
 
 ---
 
