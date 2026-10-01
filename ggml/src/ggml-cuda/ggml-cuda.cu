@@ -3832,7 +3832,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (types && a != node && b != mul && g->ne[0] == 1 && ggml_is_contiguous(g) &&
                     ggml_nrows(g) == ggml_nrows(add) && ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
                     ggml_are_same_shape(mul, add) && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
-                    ggml_is_contiguous(add)) {
+                    ggml_is_contiguous(add) && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, std::array<int, 1>{ i + 2 }.data(), 1)) {
                 ggml_cuda_op_sigmoid_mul_add(*cuda_ctx, g, a, b, add);
                 return 2;
             }
