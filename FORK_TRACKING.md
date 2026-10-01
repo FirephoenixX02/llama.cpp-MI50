@@ -9,13 +9,14 @@
 |-------|-------|
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
-| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `41ab374ac` (2026-09-11) — after push |
-| **Local branch** | `gfx906/mi50-optimization` at `9b984f6f8` +1 (GCN native FATTN `9b984f6f8` + docs sync) |
-| **Base / merge-base** | `311d4211b` - `memory: avoid allocating V cache for indexer` (#28330) |
-| **Base date** | 2026-09-10 |
-| **Commits ahead of base** | 31 on `HEAD` (29 on `origin/gfx906/mi50-optimization` + GCN native FATTN + docs sync), 29 on `origin` |
-| **Last doc update** | 2026-09-13 |
-| **Upstream `origin/master`** | `311d4211b` (mirrors ggml-org `master` at same date) |
+| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `f3d2967a5` (2026-09-28) - rebase-test merge |
+| **Local branch** | `gfx906/mi50-optimization` at `4b78912e5` + furnace generic-opt ports (16 commits) |
+| **Base / merge-base** | `4364bf723` - `metal: support left and circular padding in GGML_OP_PAD` (#29561) |
+| **Base date** | 2026-09-28 |
+| **Commits ahead of base** | 81 on `HEAD` (65 rebased fork commits + 16 furnace ports, incl. 2 manual guards) |
+| **Last doc update** | 2026-10-01 |
+| **Upstream `origin/master`** | `4364bf723` (mirrors ggml-org `master` at same date) |
+| **Donor** | `furnace/gfx906-perf` at `905021dba` (2026-09-30, sixvolts) - generic single-GPU opts ported, qwen4exp/MTP/multigpu deferred |
 
 ### How to refresh this snapshot
 
@@ -88,43 +89,66 @@ Key pillars:
 | 28 | `b744f2377` | 2026-09-11 | `docs: sync FORK_TRACKING SHA for Vega fix` | Docs | fork-original |
 | 29 | `41ab374ac` | 2026-09-11 | `docs: finalize FORK_TRACKING for Vega fix` | Docs | fork-original |
 | 30 | `9b984f6f8` | 2026-09-13 | `ggml/cuda: GCN native q8_0 FATTN tile, FATTN mask fix, HIP graph kernel guard, MMQ padding` | Perf / Fix / FATTN+MMQ+Graph | port from `milpster/gfx906-llama-cpp` |
-| 31 | `HEAD` | 2026-09-13 | `docs: update FORK_TRACKING for GCN native FATTN 9b984f6f8` | Docs | fork-original |
+| 31 | `f3d2967a5` | 2026-09-28 | `Merge branch 'gfx906/mi50-rebase-test' into gfx906/mi50-optimization` (rebase onto `4364bf723`) | Merge / Rebase | fork-original |
+| 32 | `522f788c0` | 2026-06-16 | `cuda: plain-FMA F32 GEMM for GCN without rocBLAS` | Perf / F32 | port from furnace `d1adf86fb`, sixvolts + Claude Opus 4.8 |
+| 33 | `e56497062` | 2026-09-14 | `cuda: skinny-M F32 GEMM for GCN (M <= 16)` | Perf / F32 | port from furnace `8c8ac0ee6`, sixvolts + Claude Fable 5.1 |
+| 34 | `fc99336e4` | 2026-09-23 | `cuda: register-blocked F32 GEMM for GCN, replacing the 16x16 tile` | Perf / F32 | port from furnace `674d0d666`, sixvolts + Claude Opus 5.5 |
+| 35 | `95283e38a` | 2026-09-23 | `cuda: tiled transpose path for dim-0 concat with a transposed src1` | Perf / Concat | port from furnace `19822e03a`, sixvolts + Claude Opus 5.5 |
+| 36 | `00789f864` | 2026-09-24 | `cuda: F32 matvec for few long rows on GCN (one workgroup per row)` | Perf / F32 | port from furnace `8d74e9e3c`, sixvolts + Claude Opus 5.5, tests dropped |
+| 37 | `4b1c0ba8d` | 2026-09-24 | `cuda: re-enable the repacked gate/up/GLU fusion` | Perf / Fusion | port from furnace `bd43d856a`, sixvolts + Claude Opus 5.5 |
+| 38 | `7963cbc60` | 2026-09-24 | `cuda: fuse the shared-expert gate tail (SIGMOID -> MUL -> ADD)` | Perf / Fusion | port from furnace `efdceeee4`, sixvolts + Claude Opus 5.5, qwen4exp SCALE/SILU parts excluded, tests dropped |
+| 39 | `105f616f4` | 2026-09-24 | `cuda: topk-moe - parallel rank selection for 256/512 experts on HIP` | Perf / MoE (reverted next) | port from furnace `4a8dee414`, sixvolts + Claude Opus 5.5 |
+| 40 | `1d9cb8b46` | 2026-10-01 | `ggml/cuda: add overlap check to shared-expert gate fusion` | Fix / Fusion guard | manual, subset of furnace `22a1849de` (sixvolts + Claude Opus 5.5), qwen4exp parts excluded |
+| 41 | `83fb0a58a` | 2026-09-24 | `cuda: topk-moe - drop the rank-selection kernel` | Revert / MoE | port from furnace `a9356d3ed`, sixvolts + Claude Opus 5.5 (rank kernel slower, tests kept) |
+| 42 | `60fac5340` | 2026-10-01 | `ggml/cuda: allow in-place aliasing in shared-expert fusion` | Fix / Fusion guard | manual, subset of furnace `d8e22b45e` (sixvolts + Claude Opus 5.5), qwen4exp parts excluded |
+| 43 | `a03687fef` | 2026-09-24 | `cuda: GCN F32 matvec with one wave per row (router, GDN beta/alpha)` | Perf / F32 | port from furnace `2658517c7`, sixvolts + Claude Opus 5.5, tests dropped |
+| 44 | `342348557` | 2026-09-26 | `cuda: F32 row matvec - issue all loads up front for K=2560` | Perf / F32 | port from furnace `c60c156f1`, sixvolts + Claude Opus 5.5 |
+| 45 | `e4e2e78fb` | 2026-09-27 | `cuda: get_rows - pack short rows into one block` | Perf / GET_ROWS | port from furnace `596c95b54`, sixvolts + Claude Opus 5.5 |
+| 46 | `05f064f55` | 2026-09-27 | `cuda: HIP top-k radix select - parallel bin search` | Perf / TOPK | port from furnace `47e140b4d`, sixvolts + Claude Opus 5.5 |
+| 47 | `4b78912e5` | 2026-09-27 | `cuda: topk-moe - DPP lane moves in the argmax butterfly on GCN` | Perf / MoE | port from furnace `0a2860296`, sixvolts + Claude Opus 5.5 |
 
-> `git log --reverse --oneline origin/master..HEAD` reproduces this order (published `41ab374ac` at 29 commits; `HEAD` adds GCN native FATTN `9b984f6f8` + docs sync).
+> `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`1d9cb8b46`, `60fac5340`) credit the furnace source commit in the body.
+>
+> Filter applied (donor `furnace/gfx906-perf` at `905021dba`): A: multigpu excluded (`TurboPrefill` pipelining, `NO_PEER_COPY` staged copy, layer-split pipeline). B: non-opt excluded (README, tests-only, server/MTP checkpoints, `llama`/`ggml` scheduler staging, `QSA`/`GDN`/sparse/`hc`/`dsv4` arch, `cohere2` chat handler, build switches, `solve_tri` scope, bounce fix). C: only `sixvolts` + `Claude` commits ported. D: redundant skipped (`b3c18e502` write_inverse comment - local already passes `false`; `2ffa92b3c` mmq_y=64 - superseded by Vega table). Repack-`repack-gcn.cu` MMQ/matvec tiling (`Q5_1`, `Q8_0` short rows, `MMQ Q4_K/Q8_0`, `MUL_MAT_ID` cache, `2-8` token paths, merges) deferred: donor base lacks local `LEVER` batching, needs manual port. qwen4exp arch deferred to follow-up session per request.
 
 ---
 
-## File-level Impact (vs `311d4211b`)
+## File-level Impact (vs `4364bf723`)
 
  ```
   git diff --stat origin/master..HEAD
 
-   .gitignore                              |   10 +
-   FORK_TRACKING.md                        |  440 +++++
+   FORK_TRACKING.md                        |  440 ++++++
    build-llamacpp-rocm.sh                  |   27 +
    ggml/src/ggml-cuda/add-id.cu            |  117 +-
    ggml/src/ggml-cuda/common.cuh           |  143 +-
+   ggml/src/ggml-cuda/concat.cu            |   78 +
    ggml/src/ggml-cuda/fattn-common.cuh     |   93 ++
    ggml/src/ggml-cuda/fattn-mma-f16.cuh    |   18 +-
    ggml/src/ggml-cuda/fattn-tile.cuh       |  330 +++-
    ggml/src/ggml-cuda/fattn-vec.cuh        |    6 +-
    ggml/src/ggml-cuda/fattn.cu             |   63 +
+   ggml/src/ggml-cuda/getrows.cu           |   49 +
    ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 +++
-   ggml/src/ggml-cuda/ggml-cuda.cu         |  264 +++-
-   ggml/src/ggml-cuda/mmq-config-vega.cuh  |  282 ++++
+   ggml/src/ggml-cuda/ggml-cuda.cu         |  655 +++++++-
+   ggml/src/ggml-cuda/mmq-config-vega.cuh  |  283 ++++
    ggml/src/ggml-cuda/mmq.cu               |   13 +-
-   ggml/src/ggml-cuda/mmq.cuh              |   19 +-
-   ggml/src/ggml-cuda/norm.cu              |  164 ++
+   ggml/src/ggml-cuda/mmq.cuh              |   18 +-
+   ggml/src/ggml-cuda/norm.cu              |  165 ++
    ggml/src/ggml-cuda/repack-gcn.cu        | 2526 +++++++++++++++++++++++++++++++
    ggml/src/ggml-cuda/repack-gcn.cuh       |   57 +
    ggml/src/ggml-cuda/rope.cu              |   10 +
    ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
    ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
+   ggml/src/ggml-cuda/top-k.cu             |   46 +-
+   ggml/src/ggml-cuda/topk-moe.cu          |   56 +-
+   ggml/src/ggml-cuda/unary.cu             |   21 +
+   ggml/src/ggml-cuda/unary.cuh            |    4 +
    ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
    src/llama-model.cpp                     |   10 +-
-   tests/test-backend-ops.cpp              |    4 +-
-   24 files changed, 4912 insertions(+), 95 deletions(-)
-  ```
+   tests/test-backend-ops.cpp              |    8 +
+   30 files changed, 5537 insertions(+), 120 deletions(-)
+   ```
 
 ### What each file does
 
@@ -133,7 +157,7 @@ Key pillars:
 | `ggml/src/ggml-cuda/repack-gcn.cu` | +2526 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery. ~90% of fork delta. |
 | `ggml/src/ggml-cuda/repack-gcn.cuh` | +57 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
 | `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128` (`Q6_K I=64 occ2` after `9b984f6f8`), `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +264/-9 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`9b984f6f8`). |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +655 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`9b984f6f8`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row/one-wave matvecs, transpose dispatch, shared-expert fusion + guards, GLU re-enable. |
 | `ggml/src/ggml-cuda/common.cuh` | +143/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`, `cuda_graph` `kernel_funcs` + `unstable_disabled` (`9b984f6f8`). |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`ca6deda1a`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
@@ -147,12 +171,17 @@ Key pillars:
 | `ggml/src/ggml-cuda/fattn.cu` | +63 | GCN native `q8_0`/`f16+q8_0` predicates + alloc skip + `VEC` vs `TILE` routing for quantized KV (`9b984f6f8`). |
 | `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64×64`. |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
+| `ggml/src/ggml-cuda/concat.cu` | +78 | Tiled `dim-0` transpose path from furnace `19822e03a` (sixvolts + Claude Opus 5.5). |
+| `ggml/src/ggml-cuda/getrows.cu` | +49 | Short-row packing from furnace `596c95b54` (sixvolts + Claude Opus 5.5). |
+| `ggml/src/ggml-cuda/top-k.cu` | +33/-13 | Radix-select bin search from furnace `47e140b4d` (sixvolts + Claude Opus 5.5). |
+| `ggml/src/ggml-cuda/topk-moe.cu` | +44/-12 net | DPP argmax moves from furnace `0a2860296` (sixvolts + Claude Opus 5.5); rank kernel added then dropped (`4a8dee414`/`a9356d3ed`). |
+| `ggml/src/ggml-cuda/unary.cu` / `unary.cuh` | +21/+4 | `sigmoid_mul_add` kernel for shared-expert fusion from furnace `efdceeee4` (sixvolts + Claude Opus 5.5). |
 | `ggml/src/ggml-cuda/mmq.cu` | +13 | NVFP4 `y_scale` + `ids_dst` `+J_max` / `+128` padding for `J`-wide overread (`9b984f6f8`). |
 | `build-llamacpp-rocm.sh` | +27 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` `REPACK` isolation. |
 | `FORK_TRACKING.md` | +440 (new) | This doc. |
 | `.gitignore` | +10 | `results.*` `rocprof` traces + `build-llamacpp-rocm.sh`. |
 | `src/llama-model.cpp` | +6/-4 | `make_gpu_buft_list` `extra_bufts` precedence + 2D→3D broadcast. |
-| `tests/test-backend-ops.cpp` | +4/-2 | Substring `matches_filter` for `-o MUL_MAT(type_a=q4_K` partial (was exact-only -> 0 tests). |
+| `tests/test-backend-ops.cpp` | +8 | Substring `matches_filter` plus furnace `512`-expert topk cases (`4a8dee414`); per-commit kernel tests dropped to keep diff small. |
 
 ---
 
@@ -427,6 +456,32 @@ Source: `milpster/gfx906-llama-cpp` (`d14628d04`, `eaca6d43`, `7cfc00904`, `923a
 | 32 | `MMQ` Vega `Q6_K` + padding | `mmq-config-vega.cuh:5` `mmq.cu:138` `mmq.cuh:377` | `Q6_K` `I=64 occ2` (was `128/1`) `+4.2%` PP, `src1_scale +128` / `ids_dst +J_max` / `src1_q8_1 J_max` for `J`-wide tail overread, `J_max` fallback to smallest `J` (8..128). | Fixes `NVFP4`/`ids` OOB |
 
 `fattn` native path is `GGML_USE_HIP` `GCN`-only (`#if defined(GGML_USE_HIP)`) so no `CDNA/RDNA/NV` impact. `Q->ne[1]>2` guard keeps small-Q prompt tails/MTP verify on `f16` convert (shares shadow sizing in `fattn.cu:738` and dispatch `fattn-tile.cuh:1450` so they cannot disagree). Bench: default `auto` keeps `f16` convert while shadow fits (small ctx), switches to compact native at large `kv_len` where native tile's once-per-block K/V reuse wins.
+
+---
+
+## Furnace gfx906-perf Generic-Opt Ports (2026-10-01, donor `905021dba`)
+
+Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf` at `905021dba` (2026-09-30). Author `sixvolts <rigel@sixvolts.org>`, co-author `Claude` (Opus 4.8 / Fable 5.1 / Opus 5.5, see commit trailers). Cherry-picked with original authorship preserved; per-commit `tests/test-backend-ops.cpp` hunks dropped except the `512`-expert topk cases. Manual guards credit the furnace source in the body.
+
+| # | Local | Furnace | Change | Status |
+|---|-------|---------|--------|--------|
+| 32 | `522f788c0` | `d1adf86fb` | Plain-FMA tiled F32 GEMM for GCN (no rocBLAS Tensile path). | Ported |
+| 33 | `e56497062` | `8c8ac0ee6` | Skinny-M F32 GEMM (M<=16, float4 + DPP/cross-wave reduce). | Ported |
+| 34 | `fc99336e4` | `674d0d666` | Register-blocked F32 GEMM (64x64 tile, 4x4/thread, LDS k-major). | Ported, replaces 16x16 tile |
+| 35 | `95283e38a` | `19822e03a` | Tiled transpose for dim-0 concat with transposed src1. | Ported |
+| 36 | `00789f864` | `8d74e9e3c` | F32 matvec for few long rows (one 1024-thread WG per row). | Ported, tests dropped |
+| 37 | `4b1c0ba8d` | `bd43d856a` | Re-enable repacked gate/up/GLU fusion (repack fuse gate). | Ported |
+| 38 | `7963cbc60` | `efdceeee4` | Shared-expert gate tail fusion (SIGMOID->MUL->ADD, FP contraction off). qwen4exp SCALE/SILU parts excluded. | Ported subset, tests dropped |
+| 39/41 | `105f616f4`/`83fb0a58a` | `4a8dee414`/`a9356d3ed` | Parallel rank selection added then dropped (slower than warp kernel). Net: tests only. | Ported pair |
+| 40 | `1d9cb8b46` | subset of `22a1849de` | Overlap guard on shared-expert fusion. qwen4exp + GFXPROF_NAMES parts excluded. | Manual |
+| 42 | `60fac5340` | subset of `d8e22b45e` | In-place aliasing helper `ggml_cuda_fusion_inputs_ok` for shared-expert fusion. qwen4exp parts excluded. | Manual |
+| 43 | `a03687fef` | `2658517c7` | GCN F32 matvec one wave per row (16<rows<=16384, K>=1024). | Ported, tests dropped |
+| 44 | `342348557` | `c60c156f1` | F32 row matvec with K/4 loads issued up front (K=2560 router). | Ported |
+| 45 | `e4e2e78fb` | `596c95b54` | get_rows short-row packing (one block). | Ported |
+| 46 | `05f064f55` | `47e140b4d` | HIP top-k radix select with parallel bin search. | Ported |
+| 47 | `4b78912e5` | `0a2860296` | topk-moe DPP lane moves in argmax butterfly on GCN. | Ported |
+
+Deferred: repack-`repack-gcn.cu` tiling (`Q5_1`, `Q8_0` short rows, `MMQ Q4_K/Q8_0`, `MUL_MAT_ID` cache, `2-8` token paths, `Q8_0`/F32 merges, `Q4_K` MoE GLU, `8ac1bc756` GLU) - donor base lacks local `LEVER` batching, needs manual port. qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A.
 
 ---
 
