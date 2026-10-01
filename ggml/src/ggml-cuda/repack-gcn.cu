@@ -1591,6 +1591,73 @@ static __global__ void __launch_bounds__(256, MIN_BLOCKS) mul_mat_vec_q4k_repack
 #endif // defined(GGML_USE_HIP) && defined(GCN)
 }
 
+// MoE decode Q4_K gate+up GLU for K = 16*ITERS sub-blocks: 16 lanes per row (4 rows per wave,
+// 16 per workgroup), each lane takes ITERS whole sub-blocks, so every loaded byte is used.
+template <int ITERS, int LANES = 16>
+static __global__ void __launch_bounds__(256) mul_mat_vec_q4k_repacked_glu16(
+        const uint8_t * __restrict__ wup, const uint8_t * __restrict__ wgate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne1, const int glu_op, const int32_t * __restrict__ ids,
+        const size_t expert_stride, const uint32_t xs_id, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(GCN)
+    constexpr uint32_t n_sub   = LANES * ITERS;
+    constexpr uint32_t nsp     = ((n_sub & (n_sub - 1u)) == 0u) ? (n_sub + 1u) : n_sub;
+    constexpr uint32_t n_super = n_sub / 8;
+    const uint32_t a = blockIdx.y;
+    const uint32_t e = (uint32_t) ids[a];
+    xq += (size_t) a * xs_id;
+    y  += (size_t) a * dst_s1;
+    const uint8_t * wb[2] = { wup + e * expert_stride, wgate + e * expert_stride };
+
+    const int l16 = threadIdx.x % LANES;
+    const uint32_t row = blockIdx.x * (256 / LANES) + threadIdx.x / LANES;
+    const bool valid = row < ne1;
+    const uint32_t rr = valid ? row : 0;
+
+    float acc[2] = { 0.0f, 0.0f };
+#pragma unroll
+    for (int j = 0; j < ITERS; j++) {
+        const uint32_t sb = l16 + LANES * j;
+        const block_q8_1 * xb = xq + sb;
+        const float dx = __low2float(xb->ds);
+        const float sx = __high2float(xb->ds);
+        const int4 xa = *reinterpret_cast<const int4 *>(xb->qs);
+        const int4 xc = *reinterpret_cast<const int4 *>(xb->qs + 16);
+#pragma unroll
+        for (int w2 = 0; w2 < 2; w2++) {
+            const uint4    * nib = reinterpret_cast<const uint4 *>(wb[w2]);
+            const uint16_t * smp = reinterpret_cast<const uint16_t *>(wb[w2] + (size_t) ne1 * nsp * 16);
+            const uint32_t * ddp = reinterpret_cast<const uint32_t *>(wb[w2] + (size_t) ne1 * nsp * 16 + (size_t) ne1 * nsp * 2);
+            const uint4    q  = nib[(size_t) rr * nsp + sb];
+            const uint16_t sm = smp[(size_t) rr * nsp + sb];
+            const uint32_t dd = ddp[(size_t) rr * n_super + (sb >> 3)];
+            const uint16_t d_bits = (uint16_t)(dd & 0xFFFF), dmin_bits = (uint16_t)(dd >> 16);
+            const float dsc  = __half2float(*reinterpret_cast<const __half *>(&d_bits)) * (float)(sm & 0xFFu);
+            const float deff = __half2float(*reinterpret_cast<const __half *>(&dmin_bits)) * (float)(sm >> 8);
+            int idot = 0;
+            idot = ggml_cuda_dp4a((int)( q.x       & 0x0F0F0F0Fu), xa.x, idot);
+            idot = ggml_cuda_dp4a((int)( q.y       & 0x0F0F0F0Fu), xa.y, idot);
+            idot = ggml_cuda_dp4a((int)( q.z       & 0x0F0F0F0Fu), xa.z, idot);
+            idot = ggml_cuda_dp4a((int)( q.w       & 0x0F0F0F0Fu), xa.w, idot);
+            idot = ggml_cuda_dp4a((int)((q.x >> 4) & 0x0F0F0F0Fu), xc.x, idot);
+            idot = ggml_cuda_dp4a((int)((q.y >> 4) & 0x0F0F0F0Fu), xc.y, idot);
+            idot = ggml_cuda_dp4a((int)((q.z >> 4) & 0x0F0F0F0Fu), xc.z, idot);
+            idot = ggml_cuda_dp4a((int)((q.w >> 4) & 0x0F0F0F0Fu), xc.w, idot);
+            acc[w2] += dsc * dx * (float) idot - deff * sx;
+        }
+    }
+    const float up_v   = warp_reduce_sum<LANES>(acc[0]);
+    const float gate_v = warp_reduce_sum<LANES>(acc[1]);
+    if (l16 == 0 && valid) {
+        const float g = glu_op == (int) GGML_GLU_OP_SWIGLU ? ggml_cuda_op_silu_single(gate_v) : ggml_cuda_op_gelu_single(gate_v);
+        y[row] = g * up_v;
+    }
+#else
+    GGML_UNUSED_VARS(wup, wgate, xq, y, ne1, glu_op, ids, expert_stride, xs_id, dst_s1);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_USE_HIP) && defined(GCN)
+}
+
 // int8 MMQ tile GEMM straight from the repacked planes (prefill path).
 // Y[tok, row] = Xq8[tok, :] . W[row, :] without dequantizing W.
 //
@@ -3001,6 +3068,13 @@ void ggml_cuda_mul_mat_repacked_fused_glu(ggml_backend_cuda_context & ctx,
             ne10_padded, src1->ne[1], 1, 1, stream);
     }
     const uint32_t xs_eff = src1->ne[1] == 1 ? 0u : (uint32_t) x_stride;
+    static const bool glu16 = getenv("GGML_CUDA_NO_Q4K_GLU16") == nullptr;
+    if (glu16 && ne00 == 2560) {
+        const dim3 grid16((ne01 + 15) / 16, n_assign, 1);
+        mul_mat_vec_q4k_repacked_glu16<5><<<grid16, 256, 0, stream>>>(wu, wg, (const block_q8_1 *) src1_q8_1.get(), dst_d, (uint32_t) ne01, glu_op,
+            (const int32_t *) ids->data, expert_stride, xs_eff, dst_s1);
+        return;
+    }
     // one row per wave: the 2-row kernel needs 51 VGPRs (4 waves/SIMD) and is latency-bound
     const dim3 grid((ne01 + 3) / 4, n_assign, 1);
     mul_mat_vec_q4k_repacked_glu<true, 1><<<grid, 256, 0, stream>>>(
