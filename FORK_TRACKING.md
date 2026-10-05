@@ -10,13 +10,13 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `f3d2967a5` (2026-09-28) - rebase-test merge |
-| **Local branch** | `gfx906/mi50-optimization` at `e33ef09de` + repack tiling ports (24 commits) |
+| **Local branch** | `gfx906/mi50-optimization` at `48d884d02` + 11 uncommitted furnace ports (working tree) |
 | **Base / merge-base** | `4364bf723` - `metal: support left and circular padding in GGML_OP_PAD` (#29561) |
 | **Base date** | 2026-09-28 |
-| **Commits ahead of base** | 105 on `HEAD` (65 rebased fork commits + 16 furnace generic opts + 24 furnace repack tiling) |
-| **Last doc update** | 2026-10-01 |
+| **Commits ahead of base** | 107 on `HEAD` (65 rebased fork commits + 16 furnace generic opts + 24 furnace repack tiling + 2 local) + 11 uncommitted ports |
+| **Last doc update** | 2026-10-05 |
 | **Upstream `origin/master`** | `4364bf723` (mirrors ggml-org `master` at same date) |
-| **Donor** | `furnace/gfx906-perf` at `905021dba` (2026-09-30, sixvolts) - generic single-GPU opts ported, qwen4exp/MTP/multigpu deferred |
+| **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported (uncommitted), GDN/qwen4exp/server/tests-only excluded |
 
 ### How to refresh this snapshot
 
@@ -129,10 +129,23 @@ Key pillars:
 | 68 | `e25a81d81` | 2026-09-27 | `cuda: fold one-column broadcast slices into the Q8_0 nc matvec; nc load prefetch` | Perf / Repack | port from furnace `9791f13e8`, sixvolts + Claude Opus 5.5, broadcast-fold deferred (LEVER-4 kept) |
 | 69 | `df1b9bd41` | 2026-09-28 | `cuda: flatten contiguous src1 slices in repacked mul_mat` | Perf / Batching | port from furnace `8bb172726`, sixvolts + Claude Opus 5.5, supersedes LEVER-4 |
 | 70 | `e33ef09de` | 2026-09-28 | `cuda: single-token fusions for a few columns` | Perf / Fusion | port from furnace `533d05dca`, sixvolts + Claude Fable 5.1, hc_up kernel excluded (qwen4exp) |
+| 71 | `0039a415a` | 2026-10-01 | `docs: update FORK_TRACKING for repack tiling ports with attribution` | Docs | fork-original |
+| 72 | `48d884d02` | 2026-10-01 | `tests: add SIGMOID_MUL_ADD whole-graph cases for shared-expert fusion` | Testing | fork-original |
+| 73 | uncommitted | 2026-10-05 | `cuda: MoE expert weight-once few-token gate/up (dedup)` | Perf / MoE | manual port of furnace `99e97eafc`, sixvolts + Claude Opus 5.5 |
+| 74 | uncommitted | 2026-10-05 | `cuda: weight-once 2..16-col dense KQ matvec` | Perf / Repack | manual port of furnace `0934af928`, sixvolts + Claude Opus 5.5, Q5_K/Q6_K <=8 keep LEVER ncols |
+| 75 | uncommitted | 2026-10-05 | `cuda: Q6_K int8 expansion at MMQ LDS staging` | Perf / MMQ | manual port of furnace `15d76b19d`, sixvolts + Claude Opus 5.5 |
+| 76 | uncommitted | 2026-10-05 | `cuda: residual ADD into RMS_NORM -> MUL (+q8_1) fusion` | Perf / Fusion | manual port of furnace `8a8f44363`, sixvolts + Claude Opus 5.5 |
+| 77 | uncommitted | 2026-10-05 | `cuda: split-K for skinny F32 GEMMs` | Perf / F32 | manual port of furnace `c5bc7f986`, sixvolts + Claude Opus 5.5 |
+| 78 | uncommitted | 2026-10-05 | `cuda: rank-select top-k for 256/512 experts` | Perf / TOPK | manual port of furnace `bafaf7d73`, sixvolts + Claude Fable 5.1 |
+| 79 | uncommitted | 2026-10-05 | `cuda: MoE decode chain (down+reduce, q8 emit, LDS nc, loads-first)` | Perf / MoE | manual port of furnace `69db7bf5d`, sixvolts + Claude Fable 5.1, cur_cgraph added for emit |
+| 80 | uncommitted | 2026-10-05 | `cuda: Q4_0/IQ repack, Q3_K relabel, narrow MMQ tiles` | Perf / Repack | manual port of furnace `7f70fff53`, sixvolts + Claude Fable 5.1, tests + test entry points skipped |
+| 81 | uncommitted | 2026-10-05 | `cuda: loads-first dense KQ/Q8_0 matvecs + Q4_K GLU` | Perf / Repack | manual port of furnace `b8eb8050f`, sixvolts + Claude Fable 5.1 |
+| 82 | uncommitted | 2026-10-05 | `cuda: MMQ 8B-aligned staging + padded LDS rows, expert guards` | Perf / MMQ | manual port of furnace `ae7fdb2d7`, sixvolts + Claude Fable 5.1 |
+| 83 | uncommitted | 2026-10-05 | `cuda: KQ thread-packed experts, Q8 dispatch by K, Q8 hoist opt-in` | Perf / Repack | manual port of furnace `7bac8169e`, sixvolts + Claude Fable 5.1, tests skipped |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`1d9cb8b46`, `60fac5340`) credit the furnace source commit in the body.
 >
-> Filter applied (donor `furnace/gfx906-perf` at `905021dba`): A: multigpu excluded (`TurboPrefill` pipelining, `NO_PEER_COPY` staged copy, layer-split pipeline). B: non-opt excluded (README, tests-only, server/MTP checkpoints, `llama`/`ggml` scheduler staging, `QSA`/`GDN`/sparse/`hc`/`dsv4` arch, `cohere2` chat handler, build switches, `solve_tri` scope, bounce fix). C: only `sixvolts` + `Claude` commits ported. D: redundant skipped (`b3c18e502` write_inverse comment - local already passes `false`; `2ffa92b3c` mmq_y=64 - superseded by Vega table). Repack-`repack-gcn.cu` MMQ/matvec tiling (`Q5_1`, `Q8_0` short rows, `MMQ Q4_K/Q8_0`, `MUL_MAT_ID` cache, `2-8` token paths, merges) deferred: donor base lacks local `LEVER` batching, needs manual port. qwen4exp arch deferred to follow-up session per request.
+> Filter applied (donor `furnace/gfx906-perf` at `fc353a5ac`, range `905021dba..7bac8169e`): A: multigpu excluded (none new in range). B: non-opt excluded (`300fdfe3b` server `/props` config, `746887a5c` tests-only bench shapes, `47f6e5b8a` server `_exit`). C: GDN/qwen4exp arch excluded (`058d97848` GDN gather elision fix, `50798f69b` GDN gate/softplus/beta fusion, `a2207dd89` GDN q/k norm pairs, `3a30ac2c2` recurrent conv-step fusion - local has no GDN fusion base). D: only `sixvolts` + `Claude` commits ported. Earlier filter (donor at `905021dba`): multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split), README/tests-only/server/MTP/`llama` scheduler staging, `QSA`/sparse/`hc`/`dsv4` arch, `cohere2` handler, build switches, `solve_tri` scope, bounce fix; redundant skipped (`b3c18e502`, `2ffa92b3c`). Prior repack-tiling deferrals resolved via manual LEVER-adapted ports. qwen4exp arch still deferred per request.
 
 ---
 
@@ -170,8 +183,10 @@ Key pillars:
    ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
    src/llama-model.cpp                     |   10 +-
    tests/test-backend-ops.cpp              |    8 +
-   30 files changed, 5537 insertions(+), 120 deletions(-)
-   ```
+    30 files changed, 5537 insertions(+), 120 deletions(-)
+    ```
+
+    Uncommitted working tree (2026-10-05, 11 furnace ports above): `repack-gcn.cu` +2408/-~190 (nibble+Q4_0/IQ kernels, kq_nc, dedup, pack/down-reduce, lds_nc, loads-first, MMQ `mmq_x8`/padding, Q3_K relabel, narrow MMQ, emit/keep, dispatch), `ggml-cuda.cu` +133 (split-K F32, down-reduce matcher, add-norm matcher, `cur_cgraph`), `norm.cu` +93 (add_rms_norm_mul), `topk-moe.cu` +143 (rank kernel), `norm.cuh` +5, `repack-gcn.cuh` +19 (down-reduce decl, emit `id_blocks_per_row`, invalidate `keep`), `common.cuh` +1 (`cur_cgraph`).
 
 ### What each file does
 
@@ -335,6 +350,7 @@ Key pillars:
 - `n_tokens/ne11==1` paths collapse to original launch -> single-stream byte-unchanged for concurrent-decode batching commits.
 - Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`, `GGML_CUDA_FATTN_PATH` (`auto`/`force_convert`/`force_native` for `9b984f6f8` native `q8_0` tile).
 - `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage. `9b984f6f8` adds `mask s31` fix, `graph kernel guard` (MUL_MAT_ID quantize swap), `MMQ` `J_max`/`NVFP4` padding — no PPL delta, graph stable on spec-decode fan-out.
+- 2026-10-05 ports: full `build-llamacpp-rocm.sh` clean; `test-backend-ops -o MUL_MAT` / `-o RMS_NORM` / `-o TOPK` / `-o ADD` all `OK`; `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p32 -n16` runs (`pp32 ~385`, `tg16 ~77`). New env gates: `GGML_CUDA_NO_MOE_DEDUP`, `GGML_CUDA_NO_KQ_NC`, `GGML_CUDA_NO_F32_SPLITK`, `GGML_CUDA_NO_TOPK_RANK`, `GGML_CUDA_NO_ADD_NORM_FUSION`, `GGML_CUDA_DOWN_REDUCE_R` (=4, 0 off), `GGML_CUDA_Q5_1_DOWN_R` (=4, 0 SEG), `GGML_CUDA_NO_GLU16_Q8`, `GGML_CUDA_NO_Q8_LDS_NC`, `GGML_CUDA_NO_Q8_NC_CHUNK`, `GGML_CUDA_NO_Q8_MULTI_UNROLL`, `GGML_CUDA_NO_Q8_GLU_UNROLL`, `GGML_CUDA_REPACK_Q4_0` (=1, 0 off), `GGML_CUDA_REPACK_IQ` (=1, 0 off), `GGML_CUDA_Q3K_RELABEL` (=1, 0 keeps 3-bit kernels), `GGML_CUDA_NO_MMQ_NARROW`, `GGML_CUDA_NO_Q4K_FENCE`, `GGML_CUDA_NO_KQ_HOIST`, `GGML_CUDA_Q8_HOIST` (=opt-in), `GGML_CUDA_Q8_ROWU` (=all/r2/old), `GGML_CUDA_KQ_DOWN_R` (=4, 0 off), `GGML_CUDA_REPACK_TRACE`, `GGML_CUDA_FUSE_DEBUG`. No new `tests/` files added (repo policy; furnace `test-repack-host`/`test-repack-bench` hunks skipped).
 
 ---
 
@@ -350,6 +366,18 @@ Key pillars:
 | `REPACK_NOFOLD=1` | unset | Disable `ssm_out` `ne12` fold |
 | `GFXPROF=1` | unset | HIP-events per-op profiler |
 | `GGML_CUDA_FATTN_PATH=auto\|force_convert\|force_native` | `auto` | FATTN quantized-KV path selector (`9b984f6f8`): `auto` probes free mem vs `f16` shadow (20% headroom) per device, `force_*` overrides for bench. |
+| `GGML_CUDA_REPACK_Q4_0=1` / `GGML_CUDA_REPACK_IQ=1` | ON (0 opts out) | Q4_0 / IQ4_NL / IQ4_XS / IQ3_S repack, 2D weights only (`7f70fff53` port) |
+| `GGML_CUDA_Q3K_RELABEL=1` | ON (0 keeps 3-bit kernels) | Q3_K stored/computed as Q6_K planes (exact) |
+| `GGML_CUDA_NO_MMQ_NARROW=1` | unset | Restore 64-wide MMQ token tile for <=48 columns |
+| `GGML_CUDA_NO_KQ_NC=1` | unset | KQ/nibble 2..16-col matvec back to MMQ/LEVER path |
+| `GGML_CUDA_NO_MOE_DEDUP=1` | unset | Few-token MoE expert-dedup GLU off |
+| `GGML_CUDA_NO_F32_SPLITK=1` | unset | Skinny F32 GEMM split-K off |
+| `GGML_CUDA_NO_TOPK_RANK=1` | unset | 256/512-expert rank top-k off |
+| `GGML_CUDA_NO_ADD_NORM_FUSION=1` | unset | Residual ADD into RMSNORM+MUL off |
+| `GGML_CUDA_DOWN_REDUCE_R=N` / `GGML_CUDA_Q5_1_DOWN_R=N` / `GGML_CUDA_KQ_DOWN_R=N` | 4 (0 off) | Fused down+reduce / pack kernel row groups |
+| `GGML_CUDA_NO_Q8_LDS_NC` / `NO_Q8_NC_CHUNK` / `NO_Q8_MULTI_UNROLL` / `NO_Q8_GLU_UNROLL` | unset | Q8_0 staged-nc / chunk / unroll variants off |
+| `GGML_CUDA_NO_KQ_HOIST=1` / `GGML_CUDA_NO_Q4K_FENCE=1` | unset | KQ hoisted loads / Q4_K sched fence off |
+| `GGML_CUDA_Q8_HOIST=1` (opt-in) / `GGML_CUDA_Q8_ROWU=all\|r2\|old` | unset / default rowu@6144 | Q8_0 hoist A/B; row-unrolled dispatch select |
 | `GGML_CUDA_ALLREDUCE=internal\|nccl` | auto | Multi-GPU all-reduce backend choice |
 | `GPU_TARGETS=gfx906` | - | HIP compile target |
 
@@ -482,9 +510,9 @@ Source: `milpster/gfx906-llama-cpp` (`d14628d04`, `eaca6d43`, `7cfc00904`, `923a
 
 ---
 
-## Furnace gfx906-perf Generic-Opt Ports (2026-10-01, donor `905021dba`)
+## Furnace gfx906-perf Generic-Opt Ports (2026-10-01, donor `905021dba`; 2026-10-05, donor `fc353a5ac`)
 
-Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf` at `905021dba` (2026-09-30). Author `sixvolts <rigel@sixvolts.org>`, co-author `Claude` (Opus 4.8 / Fable 5.1 / Opus 5.5, see commit trailers). Cherry-picked with original authorship preserved; per-commit `tests/test-backend-ops.cpp` hunks dropped except the `512`-expert topk cases. Manual guards credit the furnace source in the body.
+Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf` at `fc353a5ac` (2026-10-04). Author `sixvolts <rigel@sixvolts.org>`, co-author `Claude` (Opus 4.8 / Fable 5.1 / Opus 5.5, see commit trailers). Cherry-picked with original authorship preserved; per-commit `tests/test-backend-ops.cpp` hunks dropped except the `512`-expert topk cases. Manual ports credit the furnace source commit in code comments (`Ported from furnace gfx906-perf <sha>`) and are applied as uncommitted working-tree changes for contributor review.
 
 | # | Local | Furnace | Change | Status |
 |---|-------|---------|--------|--------|
@@ -526,8 +554,23 @@ Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf
 | 68 | `e25a81d81` | `9791f13e8` | nc ITERS prefetch + dispatch. Fold deferred. | Ported subset |
 | 69 | `df1b9bd41` | `8bb172726` | Flatten slices, supersedes LEVER-4. | Ported, tests dropped |
 | 70 | `e33ef09de` | `533d05dca` | multi_nc + F32 multi-NC + emit cache. hc_up kernel excluded (qwen4exp). | Ported subset |
+| 73 | uncommitted | `99e97eafc` | MoE expert weight-once few-token gate/up GLU (deduplicated routing, `GGML_CUDA_NO_MOE_DEDUP`). | Manual port |
+| 74 | uncommitted | `0934af928` | Weight-once 2..16-col dense KQ matvec (`GGML_CUDA_NO_KQ_NC`). Q5_K/Q6_K <=8 keep LEVER ncols. | Manual port |
+| 75 | uncommitted | `15d76b19d` | Q6_K int8 expansion (`repack_sub32`) at MMQ staging. | Manual port |
+| 76 | uncommitted | `8a8f44363` | Residual ADD into RMS_NORM -> MUL (+q8_1) fusion (`GGML_CUDA_NO_ADD_NORM_FUSION`) + `keep` invalidate. | Manual port |
+| 77 | uncommitted | `c5bc7f986` | Split-K skinny F32 GEMM (`GGML_CUDA_NO_F32_SPLITK`). | Manual port |
+| 78 | uncommitted | `bafaf7d73` | Rank-select top-k for 256/512 experts (`GGML_CUDA_NO_TOPK_RANK`). | Manual port |
+| 79 | uncommitted | `69db7bf5d` | MoE decode chain: Q5_1 pack/down+reduce, glu16_q8 emit, Q8_0 LDS nc + chunk, loads-first multi/GLU, trace. | Manual port, `cur_cgraph` added |
+| 80 | uncommitted | `7f70fff53` | Q4_0/IQ4_NL/IQ4_XS/IQ3_S repack + kernels, Q3_K->Q6_K relabel (`GGML_CUDA_Q3K_RELABEL`), narrow MMQ (`GGML_CUDA_NO_MMQ_NARROW`). Tests + test entry points skipped. | Manual port |
+| 81 | uncommitted | `b8eb8050f` | Loads-first dense KQ/Q8_0 matvecs + Q4_K GLU with sched fence (`GGML_CUDA_NO_Q4K_FENCE`). | Manual port |
+| 82 | uncommitted | `ae7fdb2d7` | MMQ 40B `mmq_x8` staging + padded LDS rows; expert paths back on guarded loop; `GGML_CUDA_NO_KQ_HOIST`. | Manual port |
+| 83 | uncommitted | `7bac8169e` | KQ thread-packed experts (`GGML_CUDA_KQ_DOWN_R`), Q8 dispatch by K (`GGML_CUDA_Q8_ROWU`), Q8 hoist opt-in (`GGML_CUDA_Q8_HOIST`), nib scale unpad. | Manual port, tests skipped |
 
 Deferred: qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP` kernels incl. `38e622c66`, `82e94c50e`, `f042cc0fa`, `a3f17680d`, `601fa96fd`, `1363d53ba`, `c294e1588`, `8877ee890`, `314cab9ca`, `0b78e4d91`, `c2a356097`, `1353e6875`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A. `b3c18e502` skipped as redundant.
+
+New-range exclusions (`905021dba..fc353a5ac`): server (`300fdfe3b` `/props` config, `47f6e5b8a` `_exit`), tests-only (`746887a5c` bench shapes), GDN arch (`058d97848` gather elision guard, `50798f69b` gate/softplus/beta fusion, `a2207dd89` q/k norm pairs, `3a30ac2c2` conv-step fusion) - no local GDN fusion base exists, so these have no equivalent and do not apply.
+
+Validation (2026-10-05, 1xMI50 gfx906, ROCm 7.2.4): full `build-llamacpp-rocm.sh` clean; `test-backend-ops -o MUL_MAT` (all repack types incl. Q4_0/IQ + narrow tiles), `-o RMS_NORM` (add-norm fusion), `-o TOPK` (rank kernel), `-o ADD` all `OK`; `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p32 -n16` runs (`pp32 ~385`, `tg16 ~77`).
 
 ---
 
