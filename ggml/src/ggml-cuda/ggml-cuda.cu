@@ -1686,9 +1686,9 @@ static bool ggml_cuda_f32_multi_ok(const ggml_tensor * mm) {
 #define GCN_F32_RB_BK 16
 
 template <bool VEC>
-static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
+static __device__ __forceinline__ void gcn_f32_gemm_tn_rb_body(
         const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
-        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc, const int k_begin) {
     __shared__ float As[GCN_F32_RB_BK][GCN_F32_RB_BM + 4];
     __shared__ float Bs[GCN_F32_RB_BK][GCN_F32_RB_BN + 4];
 
@@ -1704,7 +1704,7 @@ static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
 
     float acc[4][4] = {{0.0f}};
 
-    for (int k0 = 0; k0 < K; k0 += GCN_F32_RB_BK) {
+    for (int k0 = k_begin; k0 < K; k0 += GCN_F32_RB_BK) {
         const int k = k0 + lk;
         float4 a = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         float4 b = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1762,6 +1762,39 @@ static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
             }
         }
     }
+}
+
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc) {
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C, M, N, K, lda, ldb, ldc, 0);
+}
+
+// Split-K (from reinstinct, crossport R8): blockIdx.z takes k in [z*k_chunk, min(K, (z+1)*k_chunk)) and
+// writes its partial C to C + z*split_stride; gcn_f32_splitk_reduce sums the slices in z order
+// (deterministic). For skinny GEMMs (MoE router, GDN alpha/beta) that give a few tiles on 60 CUs.
+// Ported from furnace gfx906-perf c5bc7f986 (sixvolts + Claude Opus 5.5).
+template <bool VEC>
+static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb_splitk(
+        const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C,
+        const int M, const int N, const int K, const int lda, const int ldb, const int ldc,
+        const int k_chunk, const int64_t split_stride) {
+    const int kb = blockIdx.z * k_chunk;
+    gcn_f32_gemm_tn_rb_body<VEC>(A, B, C + (size_t) blockIdx.z * split_stride, M, N, min(K, kb + k_chunk), lda, ldb, ldc, kb);
+}
+
+static __global__ void __launch_bounds__(256) gcn_f32_splitk_reduce(
+        const float * __restrict__ part, float * __restrict__ y, const int64_t n, const int splits) {
+    const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    float acc = part[i];
+    for (int z = 1; z < splits; z++) {
+        acc += part[(size_t) z * n + i];
+    }
+    y[i] = acc;
 }
 
 // Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
@@ -2018,6 +2051,31 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             const dim3 grid((ne11 + GCN_F32_RB_BN - 1) / GCN_F32_RB_BN, (ne01 + GCN_F32_RB_BM - 1) / GCN_F32_RB_BM);
             const bool vec = s01 % 4 == 0 && s11 % 4 == 0 &&
                 (uintptr_t) src0_ptr % 16 == 0 && (uintptr_t) src1_ptr % 16 == 0;
+            // skinny problems: split K until ~2 tiles per CU, each slice >= 128 deep
+            // (ported from furnace gfx906-perf c5bc7f986, sixvolts + Claude Opus 5.5)
+            static const bool no_splitk = getenv("GGML_CUDA_NO_F32_SPLITK") != nullptr;
+            int splits = 1;
+            while (!no_splitk && (int64_t) grid.x * grid.y * splits < 120 && ne10 / (2 * splits) >= 128) {
+                splits *= 2;
+            }
+            if (splits > 1) {
+                const int k_chunk = (int) ((((ne10 + splits - 1) / splits) + GCN_F32_RB_BK - 1) / GCN_F32_RB_BK * GCN_F32_RB_BK);
+                const int64_t n_out = (int64_t) ne0 * ne11;
+                ggml_cuda_pool_alloc<float> part(ctx.pool(), (size_t) n_out * splits);
+                const dim3 gridz(grid.x, grid.y, splits);
+                if (vec) {
+                    gcn_f32_gemm_tn_rb_splitk<true><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0, k_chunk, n_out);
+                } else {
+                    gcn_f32_gemm_tn_rb_splitk<false><<<gridz, block, 0, main_stream>>>(
+                        (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
+                        (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0, k_chunk, n_out);
+                }
+                gcn_f32_splitk_reduce<<<(n_out + 255) / 256, 256, 0, main_stream>>>(part.get(), (float *) dst_ptr, n_out, splits);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
             if (vec) {
                 gcn_f32_gemm_tn_rb<true><<<grid, block, 0, main_stream>>>(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
@@ -4154,6 +4212,51 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // repacked MoE down projection -> router-weighted expert sum, one kernel (one token)
+    // (ported from furnace gfx906-perf 69db7bf5d, sixvolts + Claude Fable 5.1)
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0]->buffer != nullptr &&
+            ggml_backend_buft_is_cuda_repack(node->src[0]->buffer->buft) && node->src[2]->ne[1] == 1 &&
+            i + 1 < cgraph->n_nodes && ggml_node_has_n_uses(cgraph, i, 1)) {
+        ggml_cuda_moe_weighted_reduction_match match;
+        static const bool dbg = getenv("GGML_CUDA_FUSE_DEBUG") != nullptr;
+        static int dbg_left = 6;
+        const bool matched = ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, match);
+        if (matched && match.experts == node) {
+            // the reduction's own range check (its inputs vs its output); the matmul's src1 may share
+            // memory with the output (it is dead after the matmul and the fused kernel reads only its
+            // quantized copy), but the weights and ids are read by the fused kernel
+            const int output_idx = i + match.node_count;
+            auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+                const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+                return a0 < b1 && b0 < a1;
+            };
+            // ids may share memory with dst (the allocator reuses the dead routing buffer): the fused
+            // kernel then reads a copy. The expert weights live in the repack buffer.
+            const bool red_ok  = ggml_cuda_check_fusion_memory_ranges(cgraph, i + 1, match.node_count, &output_idx, 1);
+            const bool ids_ovl = overlap(match.dst, node->src[2]);
+            const bool mem_ok  = red_ok && !overlap(match.dst, node->src[0]);
+            const bool launched = mem_ok && ggml_cuda_mul_mat_id_repacked_down_reduce(*cuda_ctx, node->src[0], node->src[1],
+                node->src[2], match.weights, match.expert_scale, match.dst, ids_ovl);
+            if (dbg && dbg_left > 0 && !launched) {
+                dbg_left--;
+                fprintf(stderr, "down_reduce: %s (%s %ldx%ldx%ld) next %s: red_ok=%d ids_ovl=%d w_ovl=%d launched=%d n_used=%ld src1 [%ld,%ld,%ld]\n",
+                    node->name, ggml_type_name(node->src[0]->type), (long) node->src[0]->ne[0], (long) node->src[0]->ne[1],
+                    (long) node->src[0]->ne[2], ggml_op_name(cgraph->nodes[i + 1]->op), (int) red_ok, (int) ids_ovl,
+                    (int) overlap(match.dst, node->src[0]), (int) launched,
+                    (long) node->src[2]->ne[0], (long) node->src[1]->ne[0], (long) node->src[1]->ne[1], (long) node->src[1]->ne[2]);
+            }
+            if (launched) {
+                return match.node_count;
+            }
+        } else if (dbg && dbg_left > 0) {
+            dbg_left--;
+            fprintf(stderr, "down_reduce: %s next %s (%s): matched=%d experts_eq=%d uses1=%d\n", node->name,
+                cgraph->nodes[i + 1]->name, ggml_op_name(cgraph->nodes[i + 1]->op), (int) matched,
+                (int) (matched && match.experts == node), (int) ggml_node_has_n_uses(cgraph, i, 1));
+        }
+    }
+
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
@@ -4857,6 +4960,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // residual ADD -> RMS_NORM -> MUL: the sum stays live (next residual add reads it), so the generic
+    // single-use check cannot cover the ADD; the norm/mul pair still goes through it.
+    // Ported from furnace gfx906-perf 8a8f44363 (sixvolts + Claude Opus 5.5).
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM &&
+            cgraph->nodes[i + 1]->src[0] == node && ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        static const bool no_add_norm = getenv("GGML_CUDA_NO_ADD_NORM_FUSION") != nullptr;
+        if (!no_add_norm) {
+            ggml_tensor * mul_node = cgraph->nodes[i + 2];
+            void * yq = ggml_cuda_repack_xq_emit_target(*cuda_ctx, cgraph, mul_node);
+            if (ggml_cuda_op_add_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1], mul_node, yq)) {
+                return 2;
+            }
+            if (yq != nullptr) {
+                ggml_cuda_repack_xq_invalidate(*cuda_ctx, mul_node);
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -5198,11 +5319,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 ggml_cuda_repack_xq_invalidate(*cuda_ctx, node);
+                cuda_ctx->cur_cgraph = cgraph;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
                     for (int j = 1; j <= nodes_to_skip; ++j) {
-                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j]);
+                        ggml_cuda_repack_xq_invalidate(*cuda_ctx, cgraph->nodes[i + j], cgraph->nodes[i + nodes_to_skip]);
                     }
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;

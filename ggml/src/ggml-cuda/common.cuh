@@ -1696,6 +1696,7 @@ struct ggml_backend_cuda_context {
 
     uint64_t graph_gen = 0; // bumped per graph_compute
     ggml_cuda_repack_route_cache repack_rc;
+    const ggml_cgraph * cur_cgraph = nullptr; // graph being evaluated (for ops that look at their neighbours)
 
     ~ggml_backend_cuda_context();
 
