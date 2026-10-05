@@ -49,9 +49,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
     ggml_tensor * dst);
 
+// MUL_MAT_ID (repacked Q5_1 experts, one token) with the following router-weighted expert sum in one
+// kernel, writing the reduction's dst. false: not applicable, run the two ops separately.
+// Ported from furnace gfx906-perf 69db7bf5d (sixvolts + Claude Fable 5.1).
+bool ggml_cuda_mul_mat_id_repacked_down_reduce(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst, bool copy_ids);
+
 // Fused gate+up GLU decode path (Q4_K, dense and MoE).
+// q8_1 buffer for a producer kernel to write t's quantized blocks into (nullptr: no repacked consumer).
+// With id_blocks_per_row, a MUL_MAT_ID consumer is served too; it then holds the padded per-row stride
+// the producer must write (0 = flat layout for a MUL_MAT consumer).
+// Ported from furnace gfx906-perf 69db7bf5d (sixvolts + Claude Fable 5.1) for the MUL_MAT_ID part.
+void * ggml_cuda_repack_xq_emit_target(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const ggml_tensor * t,
+        int64_t * id_blocks_per_row = nullptr);
 // drop cached q8_1 activations whose source range node writes
-void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node);
+// keep: also spare entries produced by this node (the last node of a fused group, whose q8_1 copy the
+// fused kernel wrote from final values; the group's elided intermediates may share its memory)
+// Ported from furnace gfx906-perf 8a8f44363 (sixvolts + Claude Opus 5.5).
+void ggml_cuda_repack_xq_invalidate(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
+        const ggml_tensor * keep = nullptr);
 
 bool ggml_cuda_repack_should_fuse_glu(const ggml_tensor * up, const ggml_tensor * gate,
     const ggml_tensor * glu);
