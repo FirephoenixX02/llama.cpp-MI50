@@ -565,6 +565,9 @@ Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf
 | 81 | uncommitted | `b8eb8050f` | Loads-first dense KQ/Q8_0 matvecs + Q4_K GLU with sched fence (`GGML_CUDA_NO_Q4K_FENCE`). | Manual port |
 | 82 | uncommitted | `ae7fdb2d7` | MMQ 40B `mmq_x8` staging + padded LDS rows; expert paths back on guarded loop; `GGML_CUDA_NO_KQ_HOIST`. | Manual port |
 | 83 | uncommitted | `7bac8169e` | KQ thread-packed experts (`GGML_CUDA_KQ_DOWN_R`), Q8 dispatch by K (`GGML_CUDA_Q8_ROWU`), Q8 hoist opt-in (`GGML_CUDA_Q8_HOIST`), nib scale unpad. | Manual port, tests skipped |
+| 84 | `d87a4cd04` | 2026-09-29 | `ggml/cuda: gfx906 packed-byte subtraction (port upstream PR #29478)` | Perf / ISA | port from milpster `1373e889a`, `__vsubss4`->`__vsub4` + VMEM sched barrier |
+| 85 | `66bef6ea5` | 2026-09-29 | `llama-batch: skip recurrent pos scan when batch pos is given` | Perf / Scheduler | port from milpster `2da432a72` (batch hunk only) |
+| 86 | `b65bad9e7` | 2026-09-29 | `ggml/cuda: native q8_0-K/q4_0-V FATTN tile on GCN` | Perf / FATTN | port from milpster `2da432a72` (code only, no CMake/tests) |
 
 Deferred: qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP` kernels incl. `38e622c66`, `82e94c50e`, `f042cc0fa`, `a3f17680d`, `601fa96fd`, `1363d53ba`, `c294e1588`, `8877ee890`, `314cab9ca`, `0b78e4d91`, `c2a356097`, `1353e6875`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A. `b3c18e502` skipped as redundant.
 
@@ -573,6 +576,18 @@ New-range exclusions (`905021dba..fc353a5ac`): server (`300fdfe3b` `/props` conf
 Validation (2026-10-05, 1xMI50 gfx906, ROCm 7.2.4): full `build-llamacpp-rocm.sh` clean; `test-backend-ops -o MUL_MAT` (all repack types incl. Q4_0/IQ + narrow tiles), `-o RMS_NORM` (add-norm fusion), `-o TOPK` (rank kernel), `-o ADD` all `OK`; `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p32 -n16` runs (`pp32 ~385`, `tg16 ~77`).
 
 ---
+
+## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
+
+Source: `/home/otis/Dokumente/Build/gfx906-llama-cpp` (`https://github.com/milpster/gfx906-llama-cpp`, branch `master`). Surveyed donor-only `ggml/src/ggml-cuda/` work since 2026-08; ported as individual commits with `Original author: milp` credit. Excluded: multi-GPU/offload (`a2bf395db` GPU expert gather, `916727ecf` CPU MoE experts, `2eb48f94c` pinned bounce), cross-backend MTP/spec features (`87110171f` nvis cutoff), GDN/SSM arch (`80d985f4a`, `f81efa909`, `4d41a52d6`), server/loader/journal/bench, VEGA_TUNE off-by-default experiments (superseded by local `GGML_CUDA_FATTN_PATH`), already-equivalent (`2859157fc` sparse-drift fix, `c8edceb06` GCN table = upstream, `469de3c3d`/`cd97aeae0`/`42fc61855`/`91259ac30`/`eaca6d43` already in `9b984f6f8`), upstream-PR MMVQ merge `7dc25a9f5` (arrives via rebase; repack path bypasses canonical mmvq anyway).
+
+| Local | Donor | Change |
+|-------|-------|--------|
+| `d87a4cd04` | `1373e889a` | `__vsubss4`->`__vsub4` (fattn-vec, MMQ q2-q6 loads, q3_K/q6_K MMVQ) + VMEM sched barrier. Donor lane: Q6_K TG `19.4-19.7` -> `21.2-21.4 t/s` (~+8%), identical acceptance/SHA. |
+| `66bef6ea5` | `2da432a72` batch hunk | Skip recurrent pos linear scan when batch pos is given. No donor numbers (removes a per-batch scan). |
+| `b65bad9e7` | `2da432a72` code | Native q8_0-K/q4_0-V FATTN tile (bit-canonical loaders, shared-geometry cascade, oob gate). No donor tok/s cited; wins are memory (no F16 shadow for q4_0 V, larger ctx fits) + tile reuse at deep KV. Engages only with quantized KV (`-ctk q8_0 -ctv q4_0`); default F16 KV unaffected. |
+
+Validation: full `build-llamacpp-rocm.sh` clean (2026-10-05).
 
 ## Maintaining This Document
 
