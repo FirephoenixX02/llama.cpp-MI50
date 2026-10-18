@@ -7028,19 +7028,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
-        case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:
         case GGML_OP_DIAG:
+        case GGML_OP_FILL:
+            return true;
         case GGML_OP_SOLVE_TRI:
 #if defined(GGML_USE_HIP)
             {
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (GGML_CUDA_CC_IS_GCN(cc)) {
-                    if (op->src[0] && op->src[1]) {
-                        return op->src[0]->ne[0] <= 64 && op->src[1]->ne[0] <= 64;
-                    }
-                    return false;
+                    return op->src[0] != nullptr && op->src[1] != nullptr &&
+                        op->src[0]->ne[0] <= 64 && op->src[1]->ne[0] <= 64;
                 }
             }
 #endif
