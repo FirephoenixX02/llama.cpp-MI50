@@ -9,13 +9,13 @@
 |-------|-------|
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
-| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `f3d2967a5` (2026-09-28) - rebase-test merge |
-| **Local branch** | `gfx906/mi50-optimization` at `48d884d02` + 11 uncommitted furnace ports (working tree) |
+| **Fork branch (published)** | `origin/gfx906/mi50-optimization` fast-forward to `58649c998` + this doc update (2026-10-18) |
+| **Local branch** | `gfx906/mi50-optimization` at `58649c998` + this doc update (2026-10-18), clean |
 | **Base / merge-base** | `4364bf723` - `metal: support left and circular padding in GGML_OP_PAD` (#29561) |
 | **Base date** | 2026-09-28 |
-| **Commits ahead of base** | 107 on `HEAD` (65 rebased fork commits + 16 furnace generic opts + 24 furnace repack tiling + 2 local) + 11 uncommitted ports |
-| **Last doc update** | 2026-10-05 |
-| **Upstream `origin/master`** | `4364bf723` (mirrors ggml-org `master` at same date) |
+| **Commits ahead of base** | 115 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
+| **Last doc update** | 2026-10-18 |
+| **Upstream `origin/master`** | `5aeac37a3` (2026-10-18, 491 commits since base) - rebase onto it pending |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported (uncommitted), GDN/qwen4exp/server/tests-only excluded |
 
 ### How to refresh this snapshot
@@ -51,7 +51,7 @@ Key pillars:
 2. **Repacked MMQ GEMM for prefill** - 2D-tiled dp4a GEMM consuming repacked planes directly.
 3. **Multi-quant + broadcast + MoE extensions** - Q5_K/Q6_K/Q8_0/Q3_K in repacked path, 2D weight x 3D activation broadcast (GDN hybrid), 3D MUL_MAT_ID / expert-stack.
 4. **Concurrent-decode batching** - batched `ncols` matvecs and MoE per-token loops so 2-8 slots scale.
-5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, per-op profiler, ssm-conv / async memcpy / FATTN mask / HIP graph kernel guard / `J_max` padding fixes, Vega20 MMQ tuning (`Q6_K` `I=64 occ2`), native `q8_0` FATTN tile (shadow skip, `GGML_CUDA_FATTN_PATH`).
+5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, GCN `supports_op` gate fix (FILL/TRI/DIAG), per-op profiler, ssm-conv / async memcpy / FATTN mask / HIP graph kernel guard / `J_max` padding fixes, Vega20 MMQ tuning (`Q6_K` `I=64 occ2`), native `q8_0` FATTN tile (shadow skip, `GGML_CUDA_FATTN_PATH`).
 
 ---
 
@@ -568,6 +568,7 @@ Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf
 | 84 | `d87a4cd04` | 2026-09-29 | `ggml/cuda: gfx906 packed-byte subtraction (port upstream PR #29478)` | Perf / ISA | port from milpster `1373e889a`, `__vsubss4`->`__vsub4` + VMEM sched barrier |
 | 85 | `66bef6ea5` | 2026-09-29 | `llama-batch: skip recurrent pos scan when batch pos is given` | Perf / Scheduler | port from milpster `2da432a72` (batch hunk only) |
 | 86 | `b65bad9e7` | 2026-09-29 | `ggml/cuda: native q8_0-K/q4_0-V FATTN tile on GCN` | Perf / FATTN | port from milpster `2da432a72` (code only, no CMake/tests) |
+| 87 | `58649c998` | 2026-10-18 | `ggml/cuda: fix GCN supports_op gate forcing FILL/TRI/DIAG onto CPU` | Fix / Correctness | fork-original - KDA/delta-net decode loop + PPL blowup on Ling-3.0-tiny (b1 c32 29.6 -> 1838.7); fix restores 28.03 |
 
 Deferred: qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP` kernels incl. `38e622c66`, `82e94c50e`, `f042cc0fa`, `a3f17680d`, `601fa96fd`, `1363d53ba`, `c294e1588`, `8877ee890`, `314cab9ca`, `0b78e4d91`, `c2a356097`, `1353e6875`, server/MTP, `llama`/`ggml` staging) deferred to follow-up session. Multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split) excluded per criterion A. `b3c18e502` skipped as redundant.
 
