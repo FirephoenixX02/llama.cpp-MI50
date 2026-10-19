@@ -6243,12 +6243,14 @@ static size_t ggml_backend_cuda_repack_buffer_type_get_alloc_size(
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_repack_buffer_type_interface = {
-    /* .get_name       = */ ggml_backend_cuda_repack_buffer_type_get_name,
-    /* .alloc_buffer   = */ ggml_backend_cuda_repack_buffer_type_alloc_buffer,
-    /* .get_alignment  = */ ggml_backend_cuda_repack_buffer_type_get_alignment,
-    /* .get_max_size   = */ nullptr,
-    /* .get_alloc_size = */ ggml_backend_cuda_repack_buffer_type_get_alloc_size,
-    /* .is_host        = */ nullptr,
+    /* .get_name         = */ ggml_backend_cuda_repack_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_repack_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n   = */ nullptr,
+    /* .get_alignment    = */ ggml_backend_cuda_repack_buffer_type_get_alignment,
+    /* .get_max_size     = */ nullptr,
+    /* .get_alloc_size   = */ ggml_backend_cuda_repack_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n = */ nullptr,
+    /* .is_host          = */ nullptr,
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device) {
