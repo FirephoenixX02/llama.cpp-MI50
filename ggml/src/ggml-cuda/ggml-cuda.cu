@@ -2093,7 +2093,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     //     probably because the internal kernel selection logic is suboptimal.
     if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
 #if defined(GGML_USE_HIP)
-        if (GGML_CUDA_CC_IS_GCN(cc)) {
+        // ROCm >= 7.2 ships gfx906 Tensile kernels for hipblas and they are faster than the
+        // hand-written GCN F32 GEMM (0.8B BF16 prefill: 138 ms hipblas vs 234 ms GCN for the
+        // same 366 GEMM dispatches). The custom path is opt-in for ROCm versions without
+        // gfx906 kernels.
+        static const bool gcn_f32_gemm = getenv("GGML_CUDA_GCN_F32_GEMM") != nullptr;
+        if (GGML_CUDA_CC_IS_GCN(cc) && gcn_f32_gemm) {
             if (ne01 <= GCN_F32_SKINNY_MAX_M) {
                 gcn_f32_gemm_skinny_launch(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
