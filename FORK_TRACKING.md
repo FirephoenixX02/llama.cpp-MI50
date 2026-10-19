@@ -205,7 +205,7 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 | `ggml/src/ggml-cuda/repack-gcn.cu` | +2526 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery. ~90% of fork delta. |
 | `ggml/src/ggml-cuda/repack-gcn.cuh` | +57 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
 | `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128` (`Q6_K I=64 occ2` after `2b620d7b9`), `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +655 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`2b620d7b9`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row/one-wave matvecs, transpose dispatch, shared-expert fusion + guards, GLU re-enable. |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +660 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`2b620d7b9`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row/one-wave matvecs, transpose dispatch, shared-expert fusion + guards, GLU re-enable. |
 | `ggml/src/ggml-cuda/common.cuh` | +143/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`, `cuda_graph` `kernel_funcs` + `unstable_disabled` (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`2817c3c0d`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
@@ -353,6 +353,51 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 
 ---
 
+## Benchmark vs upstream master (2026-10-19)
+
+`master` (`7951f601e`) was built in a separate worktree with the same ROCm flags
+(`-DGGML_HIP=ON -DGGML_HIP_GRAPHS=ON -DGPU_TARGETS=gfx906`, no repack) and compared on the
+same MI50. `llama-bench -ngl 99`, r=3-5, two rounds:
+
+| Model | Test | master | fork | delta |
+|-------|------|--------|------|-------|
+| Qwen3.5-9B UD-Q4_K_XL | pp512 | 757.3 | 963.0 | **+27 %** |
+| Qwen3.5-9B UD-Q4_K_XL | tg128 | 65.1 | 83.2 | **+28 %** |
+| Qwen3.5-9B UD-Q4_K_XL | pp32 | 354.1 | 415.9 | +17 % |
+| Qwen3.5-9B UD-Q4_K_XL | tg16 | 65.2 | 80.1 | +23 % |
+| Qwen3.5-0.8B BF16 | pp512 | 4356.2 | 4767.3 | +9 % |
+| Qwen3.5-0.8B BF16 | tg128 | 183.8 | 190.4 | +4 % |
+
+The quantized win comes from the repacked MMQ kernels (`mul_mat_q` Q4_K 500.5 ms ->
+`mmq_gemm_q4k_repacked` 411.3 ms, Q5_K 351.5 -> 245.4 ms, Q6_K 132.2 -> 109.9 ms for a 512
+token prefill).
+
+### F32 GEMM: hipblas is the default (2026-10-19)
+
+The fork replaced hipblas with its own GCN F32 GEMM (`gcn_f32_gemm_tn_rb`, skinny and
+split-K variants) because ROCm 7.1 shipped no gfx906 Tensile kernels. On ROCm 7.2.4 hipblas
+does have them and they are faster - `rocprofv3` kernel trace of the 0.8B BF16 prefill, same
+366 GEMM dispatches:
+
+| GEMM backend | GPU time |
+|--------------|----------|
+| hipblas/Tensile (`Cijk_Alik_Bljk_SB_MT64x64x16...`) | 138.1 ms |
+| fork `gcn_f32_gemm_tn_rb` / `_splitk` / `_skinny` | 234.4 ms (+70 %) |
+
+With the custom path on, the 0.8B BF16 prefill was 25 % slower than master (3203 vs 4362
+t/s); the rest of the fork was a net win there (faster concat 17.5 -> 3.5 ms, faster
+`gated_delta_net` 37.9 -> 25.0 ms). The custom path is therefore now opt-in
+(`GGML_CUDA_GCN_F32_GEMM=1`) and hipblas handles F32 GEMM by default:
+
+| 0.8B BF16 pp512 | master | fork (hipblas default) | fork (`GGML_CUDA_GCN_F32_GEMM=1`) |
+|-----------------|--------|------------------------|------------------------------------|
+| t/s | 4356.2 | **4767.3** | 3347.3 |
+
+For the quantized model the flip is neutral (9B pp512 963.0 vs 951.0, tg128 83.2 vs 80.3)
+and the PPL is unchanged (`6.3304`, repack on).
+
+---
+
 ## Rebase 2026-10-19 (onto upstream master `7951f601e`)
 
 The fork history carried two copies of the first 29 commits (the pre-`rebase-test` set based on
@@ -386,6 +431,7 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 - Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`, `GGML_CUDA_FATTN_PATH` (`auto`/`force_convert`/`force_native` for `2b620d7b9` native `q8_0` tile).
 - `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage. `2b620d7b9` adds `mask s31` fix, `graph kernel guard` (MUL_MAT_ID quantize swap), `MMQ` `J_max`/`NVFP4` padding — no PPL delta, graph stable on spec-decode fan-out.
 - 2026-10-05 ports: full `build-llamacpp-rocm.sh` clean; `test-backend-ops -o MUL_MAT` / `-o RMS_NORM` / `-o TOPK` / `-o ADD` all `OK`; `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p32 -n16` runs (`pp32 ~385`, `tg16 ~77`). New env gates: `GGML_CUDA_NO_MOE_DEDUP`, `GGML_CUDA_NO_KQ_NC`, `GGML_CUDA_NO_F32_SPLITK`, `GGML_CUDA_NO_TOPK_RANK`, `GGML_CUDA_NO_ADD_NORM_FUSION`, `GGML_CUDA_DOWN_REDUCE_R` (=4, 0 off), `GGML_CUDA_Q5_1_DOWN_R` (=4, 0 SEG), `GGML_CUDA_NO_GLU16_Q8`, `GGML_CUDA_NO_Q8_LDS_NC`, `GGML_CUDA_NO_Q8_NC_CHUNK`, `GGML_CUDA_NO_Q8_MULTI_UNROLL`, `GGML_CUDA_NO_Q8_GLU_UNROLL`, `GGML_CUDA_REPACK_Q4_0` (=1, 0 off), `GGML_CUDA_REPACK_IQ` (=1, 0 off), `GGML_CUDA_Q3K_RELABEL` (=1, 0 keeps 3-bit kernels), `GGML_CUDA_NO_MMQ_NARROW`, `GGML_CUDA_NO_Q4K_FENCE`, `GGML_CUDA_NO_KQ_HOIST`, `GGML_CUDA_Q8_HOIST` (=opt-in), `GGML_CUDA_Q8_ROWU` (=all/r2/old), `GGML_CUDA_KQ_DOWN_R` (=4, 0 off), `GGML_CUDA_REPACK_TRACE`, `GGML_CUDA_FUSE_DEBUG`. No new `tests/` files added (repo policy; furnace `test-repack-host`/`test-repack-bench` hunks skipped).
+- 2026-10-19 F32 GEMM default flip: `GGML_CUDA_GCN_F32_GEMM=1` re-enables the hand-written GCN F32 GEMM; by default hipblas handles F32 GEMM (faster on ROCm 7.2.4). PPL unchanged (`6.3304` on Qwen3.5-9B UD-Q4_K_XL, repack on); see "Benchmark vs upstream master".
 - 2026-10-19 rebase validation (1xMI50 gfx906, ROCm 7.2.4): full `build-llamacpp-rocm.sh` clean (no errors); `test-backend-ops -o MUL_MAT` `2450/2450 OK` on `ROCm0` (upstream grew the matrix since the last rebase), `-o RMS_NORM` / `-o TOPK` / `-o ADD` / `-o MUL_MAT_ID` / `-o FLASH_ATTN_EXT` / `-o GET_ROWS` / `-o UNARY` / `-o SOFT_MAX` all `OK`. `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p 32 -n 16 -r 2`: `pp32 392.59 ± 63.02`, `tg16 78.82 ± 2.25` (pre-rebase reference: `pp32 ~385`, `tg16 ~77`). PPL (wikitext `wiki.test.raw`, 2 chunks, ctx 1024, Qwen3.5-9B UD-Q4_K_XL): repack on `4.3965 / 6.3304` vs `GGML_CUDA_REPACK=0` `4.4011 / 6.3036` (within noise). `GGML_CUDA_FATTN_PATH=force_convert` and `force_native` with `-ctk q8_0 -ctv q8_0`: identical `PPL 6.3199`.
 
 ---
@@ -407,7 +453,8 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 | `GGML_CUDA_NO_MMQ_NARROW=1` | unset | Restore 64-wide MMQ token tile for <=48 columns |
 | `GGML_CUDA_NO_KQ_NC=1` | unset | KQ/nibble 2..16-col matvec back to MMQ/LEVER path |
 | `GGML_CUDA_NO_MOE_DEDUP=1` | unset | Few-token MoE expert-dedup GLU off |
-| `GGML_CUDA_NO_F32_SPLITK=1` | unset | Skinny F32 GEMM split-K off |
+| `GGML_CUDA_GCN_F32_GEMM=1` | unset (hipblas is the default) | Use the hand-written GCN F32 GEMM instead of hipblas |
+| `GGML_CUDA_NO_F32_SPLITK=1` | unset | Skinny F32 GEMM split-K off (only with `GGML_CUDA_GCN_F32_GEMM=1`) |
 | `GGML_CUDA_NO_TOPK_RANK=1` | unset | 256/512-expert rank top-k off |
 | `GGML_CUDA_NO_ADD_NORM_FUSION=1` | unset | Residual ADD into RMSNORM+MUL off |
 | `GGML_CUDA_DOWN_REDUCE_R=N` / `GGML_CUDA_Q5_1_DOWN_R=N` / `GGML_CUDA_KQ_DOWN_R=N` | 4 (0 off) | Fused down+reduce / pack kernel row groups |
