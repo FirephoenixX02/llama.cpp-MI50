@@ -3861,7 +3861,8 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
-                                                const ggml_tensor * set_rows) {
+                                                const ggml_tensor * set_rows,
+                                                const bool          allow_mrope = false) {
 
     if (rope->op != GGML_OP_ROPE || view->op != GGML_OP_VIEW || set_rows->op != GGML_OP_SET_ROWS) {
         return false;
@@ -3890,6 +3891,8 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         mode != GGML_ROPE_TYPE_MROPE && mode != GGML_ROPE_TYPE_IMROPE) {
         return false;
     }
+
+    GGML_UNUSED(allow_mrope);
 
     return true;
 }
@@ -3926,9 +3929,11 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // the fused kernel handles the norm/neox and M-RoPE / interleaved M-RoPE modes (not vision)
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    static const bool no_mrope = getenv("GGML_CUDA_NO_NORM_MROPE_FUSION") != nullptr;
+    const bool mrope_ok = !no_mrope && (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE);
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !mrope_ok) {
         return false;
     }
 
@@ -4573,7 +4578,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_check_edges(cgraph, node_idx, {{1, 0, 0}, {2, 0, 1}, {3, 0, 2}, {4, 0, 3}}) &&
             ggml_cuda_should_fuse_rms_norm_mul_rope(rms_norm, mul, rope) &&
-            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows)) {
+            ggml_cuda_should_fuse_rope_set_rows(rope, view, set_rows, /*allow_mrope =*/ true)) {
             int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
