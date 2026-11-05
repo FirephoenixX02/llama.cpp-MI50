@@ -14,10 +14,10 @@
 | **Base / merge-base** | `7951f601e` - `vendor : update cpp-httplib to 0.62.0 (#30785)` |
 | **Base date** | 2026-10-19 |
 | **Commits ahead of base** | 83 on `HEAD` (`git rev-list --count master..HEAD`) |
-| **Last doc update** | 2026-10-19 (rebase onto upstream master) |
+| **Last doc update** | 2026-11-05 (furnace single-GPU port round 2) |
 | **Upstream `origin/master`** | `7951f601e` (2026-10-19) - rebase done, see "Rebase 2026-10-19" below |
 | **Backup** | `backup/mi50-pre-rebase-20261018` at `87f850290` (pre-rebase HEAD) |
-| **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded |
+| **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
 
 ### How to refresh this snapshot
 
@@ -662,6 +662,29 @@ Deferred: qwen4exp arch (`GDN`/`QSA`/sparse/`hc`/`dsv4`/`MTP` kernels incl. `38e
 New-range exclusions (`905021dba..fc353a5ac`): server (`300fdfe3b` `/props` config, `47f6e5b8a` `_exit`), tests-only (`746887a5c` bench shapes), GDN arch (`058d97848` gather elision guard, `50798f69b` gate/softplus/beta fusion, `a2207dd89` q/k norm pairs, `3a30ac2c2` conv-step fusion) - no local GDN fusion base exists, so these have no equivalent and do not apply.
 
 Validation (2026-10-05, 1xMI50 gfx906, ROCm 7.2.4): full `build-llamacpp-rocm.sh` clean; `test-backend-ops -o MUL_MAT` (all repack types incl. Q4_0/IQ + narrow tiles), `-o RMS_NORM` (add-norm fusion), `-o TOPK` (rank kernel), `-o ADD` all `OK`; `llama-bench` Qwen3.5-9B UD-Q4_K_XL `-ngl 99 -p32 -n16` runs (`pp32 ~385`, `tg16 ~77`).
+
+---
+
+## Furnace gfx906-perf Ports, Round 2 (2026-11-05, donor `4f30c1bda`)
+
+Source: `/home/otis/Dokumente/Build/llamacpp-gfx906-furnace` branch `gfx906-perf` at `4f30c1bda` (2026-11-01). Author `sixvolts <rigel@sixvolts.org>` (`01f700b37`, `013ad9e02`, `5ab3eaa4a`, `963dc1514`, `0c63b6968`) with `Co-Authored-By: Claude Opus 5.5`; `Nik <69503704+nik343@users.noreply.github.com>` (`9a548180e`) with `Co-authored-by: Codex`. Manual ports credit the source commit in code comments and commit body.
+
+| Local | Furnace | Change | Status |
+|-------|---------|--------|--------|
+| `2ba96ded4` | - | `ggml_cuda_mul_mat_repacked_multi` quantized only one activation column (`ne1 = 1`), so repack Q8_0 at ubatch 2..16 produced garbage. Use `repack_quantize_x` as the donor does. | Fork fix |
+| `3b56169f8` | `01f700b37` + `013ad9e02` | Q8_0 2..4-column matvec with the activation in LDS; grid in whole rounds of resident blocks (`GGML_CUDA_NO_Q8_LDS_ROWS`, `GGML_CUDA_Q8_LDS_ROWS_ROUNDS`). `unary.cu` gate hunk not applicable (no `add_unary_mul`). | Ported |
+| `01a6f0ce6` | `5ab3eaa4a` | Deterministic radix top-k: per-chunk count/gather, column-order ties. | Ported |
+| `ed4f655a6` | `9a548180e` + `0c63b6968` | Per-type GCN K-quant repack switches (`GGML_CUDA_REPACK_Q3_K` / `_Q4_K` / `_Q5_K` / `_Q6_K`) and `repack_env_enabled()` (`off` / `false` / `no`). | Ported |
+| `1e2bfa436` | `963dc1514` | RMS_NORM + MUL + ROPE fusion for M-RoPE / IMRoPE (`GGML_CUDA_NO_NORM_MROPE_FUSION`) plus the f16 store rounding fix; new `RMS_NORM_MUL_ROPE` IMRoPE/M-RoPE cases. | Ported, adapted to the sample/channel grid clamping |
+
+Excluded: `0eb61b009` (batch embd view; targets MTP-specific copy overhead, fork has newer `llama_batch_ext` / mixed-batch code), `77eda3529` (GDN/MTP verify fusion, model-specific), `ed263812e` (needs `rms_norm_scale2`, absent). Model-specific Qwen/QSA/GDN/MTP work excluded per the donor criteria.
+
+Validation (2026-11-05, 1x MI50 gfx906, ROCm 7.2.4, `Spark-X2.6-4B-Q8_0`):
+
+- `test-backend-ops -b ROCm0`: `TOP_K` 533/533 (incl. tied keys), `ROPE` 450/450, `RMS_NORM_MUL_ROPE` 240/240 (incl. IMRoPE/M-RoPE, full and 64-dim rotary, with and without SET_ROWS).
+- `llama-perplexity` wikitext-2 ch512, ub4: LDS rows, `q8_lds_nc` and per-column fallback give identical chunk PPL (38.9503, 24.4469, 19.7742, 20.9448). `GGML_CUDA_REPACK=off` and `GGML_CUDA_REPACK_Q8_0=off` match the stock path exactly.
+- `llama-bench -p512 -n128 -r3`: repack off pp512 `1347.67`, tg128 `112.83`; Q8_0 repack on pp512 `2113.85`, tg128 `119.60`.
+- `llama-batched-bench -npp 128 -ntg 128 -ub 512`, TG t/s with `GGML_CUDA_NO_Q8_LDS_ROWS=1` -> on: B=2 `169.95` -> `199.24` (+17.2%), B=3 `231.53` -> `262.74` (+13.5%), B=4 `254.71` -> `295.09` (+15.9%). B=1 unchanged within run noise.
 
 ---
 
