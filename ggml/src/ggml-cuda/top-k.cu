@@ -92,14 +92,12 @@ struct top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
     int rank;
-    int greater_count;
-    int equal_count;
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k};
     }
 }
 
@@ -190,11 +188,52 @@ static __global__ void top_k_radix_select(
     }
 }
 
-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < nrows) {
-        states[row].greater_count = 0;
-        states[row].equal_count = 0;
+// The selected entries, placed deterministically. An atomic slot counter wrote them in arrival
+// order, so the order of the list (and, under a tied k-th key, the set) changed from run to run.
+// Each block of a row owns one contiguous column chunk; pass 1 counts the chunk's entries above
+// and equal to the k-th key, pass 2 writes them at the sum of the earlier chunks' counts, in
+// column order. The ties kept are the first `rank` in column order, as on the CPU.
+// Ported from furnace gfx906-perf 5ab3eaa4a (sixvolts + Claude Opus 5.5).
+static __device__ __forceinline__ int top_k_radix_chunk(int ncols, int blocks_per_row, int block_size) {
+    return ((ncols + blocks_per_row - 1) / blocks_per_row + block_size - 1) / block_size * block_size;
+}
+
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_count(
+        const float * __restrict__ src,
+        const top_k_radix_state * __restrict__ states,
+        int2 * __restrict__ block_counts,
+        int ncols,
+        int blocks_per_row) {
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    const uint32_t prefix = states[row].prefix;
+    const int chunk = top_k_radix_chunk(ncols, blocks_per_row, BLOCK_SIZE);
+    const int col_end = min(ncols, (row_block + 1) * chunk);
+    __shared__ int n_greater;
+    __shared__ int n_equal;
+
+    if (tid == 0) {
+        n_greater = 0;
+        n_equal = 0;
+    }
+    __syncthreads();
+
+    int greater = 0;
+    int equal = 0;
+    for (int col = row_block * chunk + tid; col < col_end; col += BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        greater += key > prefix;
+        equal += key == prefix;
+    }
+    atomicAdd(&n_greater, greater);   // integer: order-independent
+    atomicAdd(&n_equal, equal);
+    __syncthreads();
+
+    if (tid == 0) {
+        block_counts[blockIdx.x] = make_int2(n_greater, n_equal);
     }
 }
 
@@ -202,30 +241,66 @@ template<int BLOCK_SIZE>
 static __global__ void top_k_radix_gather(
         const float * __restrict__ src,
         int * __restrict__ dst,
-        top_k_radix_state * __restrict__ states,
+        const top_k_radix_state * __restrict__ states,
+        const int2 * __restrict__ block_counts,
         int ncols,
         int k,
         int blocks_per_row) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
     const float * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
-    top_k_radix_state * state = &states[row];
+    const uint32_t prefix = states[row].prefix;
+    const int rank = states[row].rank;
+    const int chunk = top_k_radix_chunk(ncols, blocks_per_row, BLOCK_SIZE);
+    const int col_end = min(ncols, (row_block + 1) * chunk);
+    __shared__ int warp_greater[32];
+    __shared__ int warp_equal[32];
 
-    for (int64_t col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
+    int n_greater = 0;   // entries before this point of the row, block-uniform
+    int n_equal = 0;
+    for (int b = 0; b < row_block; ++b) {
+        const int2 c = block_counts[row * blocks_per_row + b];
+        n_greater += c.x;
+        n_equal += c.y;
+    }
+
+    const unsigned long long lane_mask = (1ULL << lane) - 1;
+    for (int base = row_block * chunk; base < col_end; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const uint32_t key = col < col_end ? top_k_float_to_ordered(row_src[col]) : 0u;
+        const bool greater = col < col_end && key > prefix;
+        const bool equal = col < col_end && key == prefix;
+        const unsigned long long mask_g = __ballot(greater);
+        const unsigned long long mask_e = __ballot(equal);
+        if (lane == 0) {
+            warp_greater[warp] = __popcll(mask_g);
+            warp_equal[warp] = __popcll(mask_e);
+        }
+        __syncthreads();
+        int before_g = n_greater;
+        int before_e = n_equal;
+        for (int w = 0; w < BLOCK_SIZE / warpSize; ++w) {
+            if (w < warp) {
+                before_g += warp_greater[w];
+                before_e += warp_equal[w];
+            }
+            n_greater += warp_greater[w];
+            n_equal += warp_equal[w];
+        }
+        if (greater) {
+            row_dst[before_g + __popcll(mask_g & lane_mask)] = col;
+        }
+        if (equal) {
+            const int pos = before_e + __popcll(mask_e & lane_mask);
+            if (pos < rank) {
+                row_dst[k - rank + pos] = col;
             }
         }
+        __syncthreads();
     }
 }
 
@@ -242,8 +317,10 @@ static void top_k_radix_cuda(
 
     ggml_cuda_pool_alloc<top_k_radix_state> states_alloc(pool, chunk_nrows);
     ggml_cuda_pool_alloc<int> histograms_alloc(pool, (size_t) chunk_nrows * blocks_per_row * NBINS);
+    ggml_cuda_pool_alloc<int2> counts_alloc(pool, (size_t) chunk_nrows * blocks_per_row);
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
+    int2 * counts = counts_alloc.get();
 
     for (int64_t i = 0; i < nrows; i += chunk_nrows) {
         const int iter_nrows = std::min(chunk_nrows, nrows - i);
@@ -259,11 +336,11 @@ static void top_k_radix_cuda(
                 <<<iter_nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
         }
 
-        top_k_radix_reset_counters
-            <<<(iter_nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, iter_nrows);
+        top_k_radix_count<BLOCK_SIZE>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts, ncols, blocks_per_row);
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-                src, dst, states, ncols, k, blocks_per_row);
+                src, dst, states, counts, ncols, k, blocks_per_row);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;
