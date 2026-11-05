@@ -14,7 +14,7 @@
 | **Base / merge-base** | `7951f601e` - `vendor : update cpp-httplib to 0.62.0 (#30785)` |
 | **Base date** | 2026-10-19 |
 | **Commits ahead of base** | 92 on `HEAD` (`git rev-list --count master..HEAD`) |
-| **Last doc update** | 2026-11-05 (round-2 ports, Qwen bench, Q8_0/Q5_1 repack default-on `961362c5c`) |
+| **Last doc update** | 2026-11-05 (round-2 ports, Qwen bench, Q8_0/Q5_1 repack default-on `961362c5c`; bf16->f16 repack WIP + relabel crash fix, uncommitted) |
 | **Upstream `origin/master`** | `7951f601e` (2026-10-19) - rebase done, see "Rebase 2026-10-19" below |
 | **Backup** | `backup/mi50-pre-rebase-20261018` at `87f850290` (pre-rebase HEAD) |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -444,6 +444,7 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 | `GGML_CUDA_REPACK_Q3_K` / `_Q4_K` / `_Q5_K` / `_Q6_K` | ON (`0`/`off`/`false`/`no` opts out) | Per-type K-quant repack switches (furnace `9a548180e` + `0c63b6968`). Q3_K is stored/run as Q6_K planes but the switch follows the tensor type: `_Q6_K=0` leaves Q3_K on the Q6_K kernels, `_Q3_K=0` does not touch Q6_K. `_Q4_K=0` also gives up the fused gate/up GLU decode. A non-repacked tensor runs the stock MMQ / mmvq path. |
 | `GGML_CUDA_REPACK_Q8_0` | ON for GCN since `961362c5c` (2026-11-05, `off` opts out); opt-in before | Spark-X2.6-4B-Q8_0 repacked pp512 `+57%` / tg128 `+6%` vs stock - the retuned decode kernels won, no retune pending anymore |
 | `GGML_CUDA_REPACK_Q5_1` | ON for GCN since `961362c5c` (`off` opts out); opt-in before | Q5_1 repack, K multiple of 32 (`qwen4exp ffn_down_exps` has K=640) |
+| `GGML_CUDA_REPACK_BF16` (WIP, uncommitted) | ON (`off` opts out); `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` also opts out | 2D MUL_MAT BF16 weights stored as f16 in the repack buffer (`set_tensor` converts bf16 -> f16 row-major); `ggml_cuda_mul_mat` relabels BF16 -> F16 (thread_local tensor) so the stock f16 mmvf/Hgemm path runs. `token_embd` unaffected (loader probe maps it to GET_ROWS, which the repack buft gate rejects, so it stays in the default buffer). |
 | `GGML_CUDA_REPACK_MOE=0/1` | OFF until `349128ba3` | Q4_K/Q5_K half-block MoE path |
 | `GGML_CUDA_REPACK_NO_MMQ=1` | unset | Force dequant+GemmEx fallback for `ne11>1` repacked |
 | `REPACK_TRACE=1` | unset | Log `mul_mat` dispatch shapes |
@@ -692,6 +693,62 @@ Validation (2026-11-05, 1x MI50 gfx906, ROCm 7.2.4, `Spark-X2.6-4B-Q8_0`):
 - `llama-batched-bench -npp 128 -ntg 128 -ub 512`, TG t/s with `GGML_CUDA_NO_Q8_LDS_ROWS=1` -> on: B=2 `169.95` -> `199.24` (+17.2%), B=3 `231.53` -> `262.74` (+13.5%), B=4 `254.71` -> `295.09` (+15.9%). B=1 unchanged within run noise.
 - `llama-bench` defaults, commit `c68bd0d45`, `-ngl 99 -p512 -n128 -r5`: `Qwen3.5-0.8B BF16` pp512 `4785.28 ± 330.75`, tg128 `194.60 ± 0.88` (2026-10-19 ref `4767.3` / `190.4`, +0.4% / +2.2%); `Qwen3.5-9B UD-Q4_K_XL` pp512 `974.42 ± 14.91`, tg128 `83.75 ± 0.43` (2026-10-19 ref `963.0` / `83.2`, +1.2% / +0.7%). M-RoPE fusion A/B on the 9B (tg128, `-p16 -r3`): `GGML_CUDA_NO_NORM_MROPE_FUSION=1` `83.16 ± 0.85` vs default `84.16 ± 0.30` (~+1%). No regression on either Qwen model.
 - Q8_0 / Q5_1 repack default-on (`961362c5c`): `Spark-X2.6-4B-Q8_0` `llama-bench` with no env pp512 `2127.86 ± 50.99`, tg128 `118.96 ± 0.51` = the repack-on reference above; `llama-perplexity` wikitext-2 ch512 ub4 `--chunks 2` PPL `24.5763` matches the repack-on chunk values; `test-backend-ops -o MUL_MAT` all `OK`. `Qwen3.5-9B` (its Q8_0 tensors now repack): pp512 `997.70 ± 23.03`, tg128 `83.02 ± 0.37` vs `974.42` / `83.75` with Q8_0 off (prefill +2.4%, tg within noise).
+
+---
+
+## BF16 -> F16 Upload Conversion Repack (WIP, uncommitted 2026-11-05)
+
+Design: gfx906 has no bf16 compute, so the stock path dequantizes bf16 weights to f32 and runs Sgemm at half the
+packed-f16 rate. 2D MUL_MAT BF16 weights are stored in the repack buffer as f16 instead: `set_tensor` converts
+bf16 -> f16 row-major (`repack_bf16_as_f16_host`, same 2 bytes, no interleave) and `ggml_cuda_mul_mat` relabels
+the tensor BF16 -> F16 so the stock f16 mmvf/Hgemm path runs. Opt-outs: `GGML_CUDA_REPACK_BF16=off` and
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` (that env would read the f16 bits as bf16). Uncommitted delta:
+`repack-gcn.cu` +21 (`nbytes`/`supported`/`set_tensor` cases), `ggml-cuda.cu` +31/-3 (relabel + `REPACK_BF16_DEBUG`
+dispatch prints).
+
+Bench (1xMI50, ROCm 7.2.4, `llama-bench -p512 -n128 -r3`, Qwen3.5-0.8B BF16):
+| run | pp512 | tg128 |
+|---|---|---|
+| repack bf16 ON | 5808 ± 1453 | 173.1 ± 6.4 |
+| repack bf16 OFF (stock) | 4384 ± 766 | 171.7 ± 1.5 |
+
+pp +30-35% (matches the +33% cited in the commit comment); tg neutral. tg drifts 173 -> 197 t/s between sessions
+(clock noise ~±12%), so treat single-run tg deltas as noise. PPL wikitext ch1 c1024: ON 7.8480 vs OFF 7.8239
+(bf16 -> f16 mantissa truncation; within the ±1.03 error bar, re-check on a target eval before trusting exactness).
+
+### Crash: frame-resident relabelled tensor (fixed - keep the pattern in mind, it may come back)
+
+First build of the WIP segfaulted on essentially every run. Backtrace:
+`ggml_backend_buffer_get_usage(buffer=0x4)` called from `ggml_cuda_mul_mat` (the `bad_padding_clear` line).
+Forensics (gdb + hardware watchpoint on the slot):
+
+- The faulting `src0` was the frame-resident `ggml_tensor f16_weights = *src0;` stack copy.
+- At the crash, `&f16_weights` still escaped as `src0` (an entry/`REPACK_BF16_DEBUG` print showed the stack
+  pointer with an empty name), but the copy's fields never reached memory: the slot still held stale junk from
+  the previous deeper call at the same stack depth (`ggml_cuda_op_get_rows` -> `get_rows_switch_src0_type<float>`,
+  writes `buffer`-looking `0x4` and repeated `0x12000` values plus stream pointers). The stock dispatch then read
+  `src0->buffer = 0x4` and `get_usage` deref'd it. `mm: enter` showed a valid heap tensor, so the input was never
+  corrupt - only the frame copy was.
+- A trivial extra entry printf flipped the outcome from 5/5 crash to 5/5 pass: HIP clang 20 (host compile, -O2)
+  does not reliably materialize a frame-resident large struct copy when the copy's address escapes into other
+  calls. Codegen-sensitive == looks nondeterministic.
+
+Fix: the relabelled tensor now lives in `static thread_local ggml_tensor f16_weights;` inside `ggml_cuda_mul_mat`
+(same per-MUL_MAT copy cost, stable address, per-backend-thread). Validated: 5/5 + 4-chunk PPL clean,
+`llama-batched-bench -npl 1,2,3,4` clean (S_tg 190 -> 397 t/s over B=1..4), `test-backend-ops -b ROCm0 -o MUL_MAT`
+2450/2450, `Spark-X2.6-4B-Q8_0` PPL run clean, 9B `tg16 78.65` in line with the fork reference.
+
+The same *frame-resident tensor copy passed down to callees* pattern still exists in `ggml_cuda_mul_mat` and did
+not crash so far, but shares the hazard: `ggml_tensor dst_vec = *dst` (transposed F32 vector path, passed to
+`ggml_cuda_mul_mat_vec_f`) and `ggml_tensor src0_chunk` / `dst_chunk` (cublas big-weight chunked-convert path,
+passed to `ggml_cuda_mul_mat_cublas_impl`). If a crash shows up again with `buffer=<small int>` garbage or an
+empty tensor name from one of these copies, treat it as this bug first:
+
+- Repro tool: `gdb -ex "break ggml_backend_buffer_get_usage" -ex "cond 1 buffer < 0x10000"` then dump the stack
+  around `src0`; a hardware watchpoint armed at `ggml_cuda_op_get_rows` (first graph op at the same stack depth)
+  proves whether the copy ever stored.
+- Rule for future ports: do not put a `ggml_tensor` copy on the call frame when a pointer to it is passed to
+  another function; use `static thread_local`, heap, or mutate/restore in place.
 
 ---
 

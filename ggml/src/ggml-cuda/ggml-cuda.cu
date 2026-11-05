@@ -2838,10 +2838,23 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // GCN-repacked weights have a non-canonical layout; they take their
-    // own matvec / dequant+GEMM path (see repack-gcn.cu).
+    // own matvec / dequant+GEMM path (see repack-gcn.cu). BF16 weights
+    // are the exception: they are stored as f16 (set_tensor), so the
+    // type relabels and the stock f16 path runs from here.
     if (src0->buffer != nullptr && ggml_backend_buft_is_cuda_repack(src0->buffer->buft)) {
-        ggml_cuda_mul_mat_repacked(ctx, src0, src1, dst);
-        return;
+        if (src0->type == GGML_TYPE_BF16) {
+            // The buffer holds f16 bytes (set_tensor converts bf16 -> f16), only the
+            // gguf type label says bf16. The relabelled tensor must not live on this
+            // call frame: its address escapes into the stock dispatch below, and a
+            // frame-resident copy gets clobbered by callee stack reuse there.
+            static thread_local ggml_tensor f16_weights;
+            f16_weights = *src0;
+            f16_weights.type = GGML_TYPE_F16;
+            src0 = &f16_weights;
+        } else {
+            ggml_cuda_mul_mat_repacked(ctx, src0, src1, dst);
+            return;
+        }
     }
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -2856,6 +2869,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        if (getenv("REPACK_BF16_DEBUG") != nullptr) {
+            fprintf(stderr, "mm: pre-cublas %s type=%d ne=%lld,%lld,%lld ne1s=%lld bpc=%d s1t=%d dstt=%d\n", src0->name,
+                (int) src0->type, (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne11,
+                (int) bad_padding_clear, (int) src1->type, (int) dst->type);
+        }
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -2934,9 +2952,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 #endif // defined(GGML_USE_HIP)
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+        if (getenv("REPACK_BF16_DEBUG") != nullptr) {
+            fprintf(stderr, "mm: pre-mmvf %s ne=%lld,%lld,%lld ne1s=%lld nb0=%lld nb1=%lld\n", src0->name,
+                (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne11, (long long) nb00, (long long) nb01);
+        }
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
+        if (getenv("REPACK_BF16_DEBUG") != nullptr) {
+            fprintf(stderr, "mm: post-mmvf %s\n", src0->name);
+        }
         return;
     }
     // A transposed vector can still use MMVQ (i.e. ne01 == 1)
