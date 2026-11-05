@@ -6312,11 +6312,8 @@ void ggml_cuda_mul_mat_repacked_multi(ggml_backend_cuda_context & ctx, ggml_tens
     const int64_t ne00 = mms[0]->src[0]->ne[0];
     const int64_t ne10_padded = GGML_PAD(ne00, MATRIX_ROW_PADDING);
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(),
-        ne10_padded * sizeof(block_q8_1) / QK8_1);
-    quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(),
-        GGML_TYPE_Q8_0, ne00, ne00, ne00, ne00, ne10_padded, 1, 1, 1, stream);
-    const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const block_q8_1 * xq = repack_quantize_x(ctx, src1, ne10_padded, src1_q8_1, stream);
     q8_multi_args args = {};
     uint32_t rows = 0;
     for (int i = 0; i < 3; i++) {
