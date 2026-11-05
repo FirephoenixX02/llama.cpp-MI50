@@ -65,6 +65,7 @@ static inline size_t repack_gcn_nbytes(const ggml_type type_in, const int64_t ne
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:  return (size_t) ne1 * nsp * 18;
+        case GGML_TYPE_BF16:   return (size_t) ne1 * ne0 * sizeof(ggml_fp16_t); // stored as f16, canonical row-major
         default:             GGML_ABORT("unsupported repack type");
     }
 }
@@ -127,6 +128,18 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             // GGML_CUDA_REPACK_Q5_1=off opts out.
             static const bool q51 = repack_env_enabled("GGML_CUDA_REPACK_Q5_1", true);
             return q51 && t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_BF16: {
+            // gfx906 has no bf16 compute: the stock path dequantizes to f32 and runs Sgemm,
+            // at half the packed-f16 Hgemm rate. Store 2D MUL_MAT weights as f16 instead
+            // (2 bytes either way; 0.8B pp512 +33% on MI50, PPL measured unchanged). GGML_CUDA_REPACK_BF16=off
+            // opts out; GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16 would read the f16 bits as bf16, so it opts out too.
+            static const bool bf16 = repack_env_enabled("GGML_CUDA_REPACK_BF16", true);
+            static const bool compute_ok = [] {
+                const char * e = getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+                return !(e != nullptr && tolower((unsigned char) e[0]) == 'b' && tolower((unsigned char) e[1]) == 'f');
+            }();
+            return bf16 && compute_ok && ggml_n_dims(t) == 2;
         }
         case GGML_TYPE_Q4_0: {
             // 2D weights only (no expert kernels yet); GGML_CUDA_REPACK_Q4_0=0 opts out
@@ -6347,6 +6360,13 @@ bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_repack_buffer_type_get_name;
 }
 
+// bf16 bits are the top half of an f32: an f32 -> f16 round gives the stored f16 weight.
+static void repack_bf16_as_f16_host(const ggml_bf16_t * src, ggml_fp16_t * dst, const int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        dst[i] = ggml_fp32_to_fp16(ggml_compute_bf16_to_fp32(src[i]));
+    }
+}
+
 static void ggml_backend_cuda_repack_buffer_set_tensor(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor,
         const void * data, size_t offset, size_t size) {
@@ -6381,6 +6401,7 @@ static void ggml_backend_cuda_repack_buffer_set_tensor(
             case GGML_TYPE_Q5_1: repack_q5_1_host((const block_q5_1 *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q8_0: repack_q8_0_host((const block_q8_0 *) src_e, dst_e, ne0, ne1); break;
             case GGML_TYPE_Q4_0: repack_q4_0_host((const block_q4_0 *) src_e, dst_e, ne0, ne1); break;
+            case GGML_TYPE_BF16: repack_bf16_as_f16_host((const ggml_bf16_t *) src_e, (ggml_fp16_t *) dst_e, ne0 * ne1); break;
             default:             GGML_ABORT("unsupported repack type");
         }
     }
