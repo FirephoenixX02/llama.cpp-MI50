@@ -13,8 +13,8 @@
 | **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `7951f601e` (2026-10-19), 83 commits ahead, clean |
 | **Base / merge-base** | `7951f601e` - `vendor : update cpp-httplib to 0.62.0 (#30785)` |
 | **Base date** | 2026-10-19 |
-| **Commits ahead of base** | 83 on `HEAD` (`git rev-list --count master..HEAD`) |
-| **Last doc update** | 2026-11-05 (furnace single-GPU port round 2) |
+| **Commits ahead of base** | 92 on `HEAD` (`git rev-list --count master..HEAD`) |
+| **Last doc update** | 2026-11-05 (round-2 ports, Qwen bench, Q8_0/Q5_1 repack default-on `961362c5c`) |
 | **Upstream `origin/master`** | `7951f601e` (2026-10-19) - rebase done, see "Rebase 2026-10-19" below |
 | **Backup** | `backup/mi50-pre-rebase-20261018` at `87f850290` (pre-rebase HEAD) |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -259,7 +259,7 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 ### 5. `d6b882696` - Q5_K/Q6_K/Q8_0 repack + 2D-x-3D broadcast
 - **Q5_K:** nibble + `qh` u32 plane (`bit 4g+b` -> byte bit 4) + `sc|m` + `d|dmin`; `dsc*idot - deff*sx` fold.
 - **Q6_K:** nibble + 8B `h2` plane (bits 4-5) + signed per-16 scale pairs + `d`-only plane; `-32` folded via activation half-sums.
-- **Q8_0:** qs bytes + fp16 `d` stream; `ROWS=1`/`2` split at `ne01>=4096`; gated `GGML_CUDA_REPACK_Q8_0=1` (prefill +43% on 0.8B but decode -6%, needs retune).
+- **Q8_0:** qs bytes + fp16 `d` stream; `ROWS=1`/`2` split at `ne01>=4096`; gated `GGML_CUDA_REPACK_Q8_0=1` (prefill +43% on 0.8B but decode -6%, needs retune). The retune landed - default-on since `961362c5c`.
 - **Broadcast fix:** `supports_op` now accepts 2D weight x 3D activation (weight broadcast over `ne2`) for Qwen3.5 GDN hybrid; batch PPL within noise.
 - **Perf:** Pure-Q8_0 0.8B pp512 `4763 -> 6822 t/s (+43%)`.
 
@@ -317,7 +317,7 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 - **Files:** `ggml/src/ggml-cuda/ssm-conv.cu:9`
 
 ### 17. `a06580527` - Build: enable GCN repack for MI50
-- **Change:** `build-llamacpp-rocm.sh` sets `-DGGML_CUDA_REPACK=1 -DGGML_CUDA_REPACK_Q8_0=1`, `GPU_TARGETS=gfx906`, `ROCm 7.2.4` `/opt` isolation. `.gitignore` exception.
+- **Change:** `build-llamacpp-rocm.sh` sets `-DGGML_CUDA_REPACK=1 -DGGML_CUDA_REPACK_Q8_0=1`, `GPU_TARGETS=gfx906`, `ROCm 7.2.4` `/opt` isolation. `.gitignore` exception. (Those `-D` names turned out to be runtime env vars no cmake option consumes; the lines were dropped in `961362c5c`, where the runtime defaults took over.)
 - **Files:** `build-llamacpp-rocm.sh:27`, `.gitignore:1`
 
 ### 18. `8ed3854ef` - Vega20 MMQ tuning for MI50
@@ -440,8 +440,10 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 
 | Flag / Env | Default | Effect |
 |------------|---------|--------|
-| `GGML_CUDA_REPACK=1` (cmake) | ON for GCN after `349128ba3`, gated before | Enable repacked Q4_K/Q5_K/Q6_K dense + MoE path |
-| `GGML_CUDA_REPACK_Q8_0=1` | needs explicit flag | Enable Q8_0 repacked (decode still -3% vs canonical, keep for prefill +43%) |
+| `GGML_CUDA_REPACK` (runtime env) | ON for GCN after `349128ba3` (`off`/`false`/`no`/`0` opts out) | Master switch for the repack buffer type. All `GGML_CUDA_REPACK*` switches are runtime env vars - no cmake option consumes them (`961362c5c` dropped the inert `-D` lines from `build-llamacpp-rocm.sh`). |
+| `GGML_CUDA_REPACK_Q3_K` / `_Q4_K` / `_Q5_K` / `_Q6_K` | ON (`0`/`off`/`false`/`no` opts out) | Per-type K-quant repack switches (furnace `9a548180e` + `0c63b6968`). Q3_K is stored/run as Q6_K planes but the switch follows the tensor type: `_Q6_K=0` leaves Q3_K on the Q6_K kernels, `_Q3_K=0` does not touch Q6_K. `_Q4_K=0` also gives up the fused gate/up GLU decode. A non-repacked tensor runs the stock MMQ / mmvq path. |
+| `GGML_CUDA_REPACK_Q8_0` | ON for GCN since `961362c5c` (2026-11-05, `off` opts out); opt-in before | Spark-X2.6-4B-Q8_0 repacked pp512 `+57%` / tg128 `+6%` vs stock - the retuned decode kernels won, no retune pending anymore |
+| `GGML_CUDA_REPACK_Q5_1` | ON for GCN since `961362c5c` (`off` opts out); opt-in before | Q5_1 repack, K multiple of 32 (`qwen4exp ffn_down_exps` has K=640) |
 | `GGML_CUDA_REPACK_MOE=0/1` | OFF until `349128ba3` | Q4_K/Q5_K half-block MoE path |
 | `GGML_CUDA_REPACK_NO_MMQ=1` | unset | Force dequant+GemmEx fallback for `ne11>1` repacked |
 | `REPACK_TRACE=1` | unset | Log `mul_mat` dispatch shapes |
@@ -457,8 +459,11 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 | `GGML_CUDA_NO_F32_SPLITK=1` | unset | Skinny F32 GEMM split-K off (only with `GGML_CUDA_GCN_F32_GEMM=1`) |
 | `GGML_CUDA_NO_TOPK_RANK=1` | unset | 256/512-expert rank top-k off |
 | `GGML_CUDA_NO_ADD_NORM_FUSION=1` | unset | Residual ADD into RMSNORM+MUL off |
+| `GGML_CUDA_NO_NORM_MROPE_FUSION=1` | unset (fusion on) | RMSNORM+MUL+ROPE M-RoPE / IMRoPE modes back to separate rope + set_rows (furnace `963dc1514`) |
 | `GGML_CUDA_DOWN_REDUCE_R=N` / `GGML_CUDA_Q5_1_DOWN_R=N` / `GGML_CUDA_KQ_DOWN_R=N` | 4 (0 off) | Fused down+reduce / pack kernel row groups |
 | `GGML_CUDA_NO_Q8_LDS_NC` / `NO_Q8_NC_CHUNK` / `NO_Q8_MULTI_UNROLL` / `NO_Q8_GLU_UNROLL` | unset | Q8_0 staged-nc / chunk / unroll variants off |
+| `GGML_CUDA_NO_Q8_LDS_ROWS=1` | unset (path on) | Q8_0 2..4-column activation-in-LDS matvec back to `_nc` (furnace `01f700b37` + `013ad9e02`) |
+| `GGML_CUDA_Q8_LDS_ROWS_ROUNDS=N` | auto (1 round, 2 from 64K rows) | Force the resident-block round count of `q8_lds_rows` |
 | `GGML_CUDA_NO_KQ_HOIST=1` / `GGML_CUDA_NO_Q4K_FENCE=1` | unset | KQ hoisted loads / Q4_K sched fence off |
 | `GGML_CUDA_Q8_HOIST=1` (opt-in) / `GGML_CUDA_Q8_ROWU=all\|r2\|old` | unset / default rowu@6144 | Q8_0 hoist A/B; row-unrolled dispatch select |
 | `GGML_CUDA_ALLREDUCE=internal\|nccl` | auto | Multi-GPU all-reduce backend choice |
@@ -685,6 +690,8 @@ Validation (2026-11-05, 1x MI50 gfx906, ROCm 7.2.4, `Spark-X2.6-4B-Q8_0`):
 - `llama-perplexity` wikitext-2 ch512, ub4: LDS rows, `q8_lds_nc` and per-column fallback give identical chunk PPL (38.9503, 24.4469, 19.7742, 20.9448). `GGML_CUDA_REPACK=off` and `GGML_CUDA_REPACK_Q8_0=off` match the stock path exactly.
 - `llama-bench -p512 -n128 -r3`: repack off pp512 `1347.67`, tg128 `112.83`; Q8_0 repack on pp512 `2113.85`, tg128 `119.60`.
 - `llama-batched-bench -npp 128 -ntg 128 -ub 512`, TG t/s with `GGML_CUDA_NO_Q8_LDS_ROWS=1` -> on: B=2 `169.95` -> `199.24` (+17.2%), B=3 `231.53` -> `262.74` (+13.5%), B=4 `254.71` -> `295.09` (+15.9%). B=1 unchanged within run noise.
+- `llama-bench` defaults, commit `c68bd0d45`, `-ngl 99 -p512 -n128 -r5`: `Qwen3.5-0.8B BF16` pp512 `4785.28 ± 330.75`, tg128 `194.60 ± 0.88` (2026-10-19 ref `4767.3` / `190.4`, +0.4% / +2.2%); `Qwen3.5-9B UD-Q4_K_XL` pp512 `974.42 ± 14.91`, tg128 `83.75 ± 0.43` (2026-10-19 ref `963.0` / `83.2`, +1.2% / +0.7%). M-RoPE fusion A/B on the 9B (tg128, `-p16 -r3`): `GGML_CUDA_NO_NORM_MROPE_FUSION=1` `83.16 ± 0.85` vs default `84.16 ± 0.30` (~+1%). No regression on either Qwen model.
+- Q8_0 / Q5_1 repack default-on (`961362c5c`): `Spark-X2.6-4B-Q8_0` `llama-bench` with no env pp512 `2127.86 ± 50.99`, tg128 `118.96 ± 0.51` = the repack-on reference above; `llama-perplexity` wikitext-2 ch512 ub4 `--chunks 2` PPL `24.5763` matches the repack-on chunk values; `test-backend-ops -o MUL_MAT` all `OK`. `Qwen3.5-9B` (its Q8_0 tensors now repack): pp512 `997.70 ± 23.03`, tg128 `83.02 ± 0.37` vs `974.42` / `83.75` with Q8_0 off (prefill +2.4%, tg within noise).
 
 ---
 
