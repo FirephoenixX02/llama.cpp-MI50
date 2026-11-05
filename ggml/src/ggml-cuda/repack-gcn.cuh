@@ -23,17 +23,18 @@
 // (a power-of-two row stride aliases every row onto the same HBM
 // channel: ~3x matvec slowdown).
 //
-// Enabled with GGML_CUDA_REPACK=1 on GCN devices only. Weights placed
+// Enabled by default on GCN devices (runtime env GGML_CUDA_REPACK=off
+// opts out). Weights placed
 // in this buffer type cannot be read back (get_tensor aborts).
 
 bool ggml_backend_buft_is_cuda_repack(ggml_backend_buffer_type_t buft);
 
 // Returns the repack buffer type for `device`, or nullptr when disabled
-// (env GGML_CUDA_REPACK unset/0) or the device is not GCN.
+// (env GGML_CUDA_REPACK off/false/no/0) or the device is not GCN.
 ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device);
 
-// True if `t` can live in the repack buffer type: 2D Q4_K with
-// ne0 % 256 == 0.
+// True if `t` can live in the repack buffer type (contiguous 2D weight or
+// 3D expert stack of a supported type, per-type switches opt-out).
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t);
 
 // MUL_MAT with src0 in the repack buffer type. ne11 == 1 runs the
