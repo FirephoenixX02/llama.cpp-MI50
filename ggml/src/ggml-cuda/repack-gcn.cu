@@ -116,18 +116,16 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             return on && t->ne[0] % 256 == 0;
         }
         case GGML_TYPE_Q8_0: {
-            // Q8_0 repack is its own opt-in: the repacked MMQ wins
-            // prefill big (+43% on a pure-Q8_0 0.8B) but the repacked
-            // matvec loses ~6% decode to the canonical mmvq (it was
-            // tuned on MoE-expert shapes in reinstinct; on-disk Q8_0 is
-            // already nearly contiguous so repack buys less). Re-tune
-            // before considering it for default-on.
-            static const bool q8 = repack_env_enabled("GGML_CUDA_REPACK_Q8_0", false);
+            // Default-on since 2026-11-05: the retuned repacked matvec (short-row seg, splitk,
+            // flat/rowu, LDS nc and LDS rows) now wins decode too - Spark-X2.6-4B-Q8_0 pp512
+            // +57% and tg128 +6% vs the stock path. GGML_CUDA_REPACK_Q8_0=off opts out.
+            static const bool q8 = repack_env_enabled("GGML_CUDA_REPACK_Q8_0", true);
             return q8 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q5_1: {
-            // opt-in while being validated; K only needs to be a multiple of 32 (qwen4exp ffn_down_exps has K=640)
-            static const bool q51 = repack_env_enabled("GGML_CUDA_REPACK_Q5_1", false);
+            // K only needs to be a multiple of 32 (qwen4exp ffn_down_exps has K=640);
+            // GGML_CUDA_REPACK_Q5_1=off opts out.
+            static const bool q51 = repack_env_enabled("GGML_CUDA_REPACK_Q5_1", true);
             return q51 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q4_0: {

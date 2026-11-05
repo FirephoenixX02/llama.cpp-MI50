@@ -19,8 +19,6 @@ HIPCXX="$HIPCXX" HIP_PATH="$HIP_PATH" \
         -DCMAKE_EXE_LINKER_FLAGS="-L/opt/rocm-7.2.4/lib" \
         -DGGML_HIP=ON \
         -DGGML_HIP_GRAPHS=ON \
-        -DGGML_CUDA_REPACK=1 \
-        -DGGML_CUDA_REPACK_Q8_0=1 \
         -DGPU_TARGETS=gfx906 \
         -DCMAKE_BUILD_TYPE=Release
 
