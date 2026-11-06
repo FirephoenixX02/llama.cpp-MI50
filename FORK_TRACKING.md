@@ -9,12 +9,12 @@
 |-------|-------|
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
-| **Fork branch (published)** | `origin/gfx906/mi50-optimization` still at `87f850290` (pre-rebase, 2026-10-18) - rebase not pushed |
-| **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `7951f601e` (2026-10-19), 83 commits ahead, clean |
+| **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `d2685bff2` (2026-11-05, bf16 repack); `5a2255fcc` / `2aa788490` / `ffc7e39c1` + docs commit not yet pushed |
+| **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `7951f601e` (2026-10-19), 98 commits ahead, clean |
 | **Base / merge-base** | `7951f601e` - `vendor : update cpp-httplib to 0.62.0 (#30785)` |
 | **Base date** | 2026-10-19 |
-| **Commits ahead of base** | 92 on `HEAD` (`git rev-list --count master..HEAD`) |
-| **Last doc update** | 2026-11-05 (round-2 ports, Qwen bench, Q8_0/Q5_1 repack default-on `961362c5c`; bf16->f16 repack WIP + relabel crash fix, uncommitted) |
+| **Commits ahead of base** | 98 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
+| **Last doc update** | 2026-11-06 (lds_nc column-group restructure + rms_norm_mul_rope SGPR slim committed `ffc7e39c1` and validated same day, see "lds_nc column-group + rope SGPR slim" below) |
 | **Upstream `origin/master`** | `7951f601e` (2026-10-19) - rebase done, see "Rebase 2026-10-19" below |
 | **Backup** | `backup/mi50-pre-rebase-20261018` at `87f850290` (pre-rebase HEAD) |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -143,6 +143,11 @@ Key pillars:
 | 81 | `5e601af03` | 2026-10-05 | `cuda: loads-first dense KQ/Q8_0 matvecs + Q4_K GLU` | Perf / Repack | manual port of furnace `b8eb8050f`, sixvolts + Claude Fable 5.1 |
 | 82 | `5e601af03` | 2026-10-05 | `cuda: MMQ 8B-aligned staging + padded LDS rows, expert guards` | Perf / MMQ | manual port of furnace `ae7fdb2d7`, sixvolts + Claude Fable 5.1 |
 | 83 | `5e601af03` | 2026-10-05 | `cuda: KQ thread-packed experts, Q8 dispatch by K, Q8 hoist opt-in` | Perf / Repack | manual port of furnace `7bac8169e`, sixvolts + Claude Fable 5.1, tests skipped |
+| 84 | `d2685bff2` | 2026-11-05 | `ggml/hip: BF16 -> F16 upload conversion repack for GCN` | Perf / Repack | fork-original (resolves the BF16 WIP section below) |
+| 85 | `5a2255fcc` | 2026-11-06 | `cuda: bounds-check the MoE weighted-reduction fused-node walk` | Fix / Graph | port from `mx-llama.cpp ef7246cd9` |
+| 86 | `2aa788490` | 2026-11-06 | `docs: gfx906 ISA optimization notes + build-object register audit tool` | Docs / Tooling | fork-original |
+| 87 | `ffc7e39c1` | 2026-11-06 | `cuda: lds_nc column groups of 4 for NC = 6..8; rms_norm_mul_rope SGPR slim` | Perf / Repack + Rope | fork-original (restructure of the `69db7bf5d` port + notes sec. 12 SGPR slim); validated same day, see below |
+| 88 | this commit | 2026-11-06 | `docs: lds_nc column-group + rope WIP validation results` | Docs | fork-original |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`51d1cf038`, `4e78727bc`) credit the furnace source commit in the body.
 >
@@ -156,8 +161,10 @@ Key pillars:
  git diff --stat master..HEAD
 
     .gitignore                              |   10 +
-    FORK_TRACKING.md                        |  600 +++
-    build-llamacpp-rocm.sh                  |   27 +
+    FORK_TRACKING.md                        |  774 ++++
+    MI50_ISA_OPTIMIZATION_NOTES.md          |  438 ++
+    amdgcn-audit.py                         |  191 +
+    build-llamacpp-rocm.sh                  |   25 +
     ggml/src/ggml-cuda/add-id.cu            |  117 +-
     ggml/src/ggml-cuda/common.cuh           |  188 +-
     ggml/src/ggml-cuda/concat.cu            |   78 +
@@ -168,30 +175,36 @@ Key pillars:
     ggml/src/ggml-cuda/fattn.cu             |   83 +
     ggml/src/ggml-cuda/getrows.cu           |   49 +
     ggml/src/ggml-cuda/gfx906-mi50-opts.cuh |  233 ++
-    ggml/src/ggml-cuda/ggml-cuda.cu         | 1109 +++++-
+    ggml/src/ggml-cuda/ggml-cuda.cu         | 1177 +++++-
     ggml/src/ggml-cuda/mmq-config-vega.cuh  |  283 ++
     ggml/src/ggml-cuda/mmq.cu               |    6 +-
     ggml/src/ggml-cuda/mmq.cuh              |    9 +-
     ggml/src/ggml-cuda/norm.cu              |  260 ++
     ggml/src/ggml-cuda/norm.cuh             |    5 +
-    ggml/src/ggml-cuda/repack-gcn.cu        | 6383 +++++++++++++++++++++++++++++++
-    ggml/src/ggml-cuda/repack-gcn.cuh       |   84 +
-    ggml/src/ggml-cuda/rope.cu              |   10 +
+    ggml/src/ggml-cuda/repack-gcn.cu        | 6610 +++++++++++++++++++++++++++++++
+    ggml/src/ggml-cuda/repack-gcn.cuh       |   85 +
+    ggml/src/ggml-cuda/rope.cu              |  129 +-
     ggml/src/ggml-cuda/solve_tri.cu         |  109 +-
     ggml/src/ggml-cuda/ssm-conv.cu          |   10 +-
-    ggml/src/ggml-cuda/top-k.cu             |   46 +-
+    ggml/src/ggml-cuda/top-k.cu             |  171 +-
     ggml/src/ggml-cuda/topk-moe.cu          |  200 +-
     ggml/src/ggml-cuda/unary.cu             |   21 +
     ggml/src/ggml-cuda/unary.cuh            |    4 +
     ggml/src/ggml-cuda/vecdotq.cuh          |   59 +
     src/llama-batch.cpp                     |   11 +-
     src/llama-model.cpp                     |   10 +-
-    tests/test-backend-ops.cpp              |   42 +
-    32 files changed, 10524 insertions(+), 122 deletions(-)
+    tests/test-backend-ops.cpp              |   59 +-
+    34 files changed, 11804 insertions(+), 200 deletions(-)
 
 ```
 
 The 11 furnace ports that were uncommitted on 2026-10-05 are now a single commit (`5e601af03`).
+Since 2026-11-05: the BF16 repack WIP landed as `d2685bff2` (`repack-gcn.cu` 6383 -> 6596,
+`ggml-cuda.cu` relabel + guard), the MoE weighted-reduction guard is `5a2255fcc`
+(`ggml-cuda.cu` -> 1177), and `2aa788490` adds the ISA notes and the audit tool. `ffc7e39c1`
+then restructures the `lds_nc` Q8_0 kernel (column groups of 4 for NC 6..8, repack-gcn.cu
+6596 -> 6610) and slims the fused `rms_norm_mul_rope` kernel args (rope.cu 75 -> 129 stat
+lines, i32 strides + plain mul-modulo).
 Changes vs the pre-rebase tree (`4364bf723..87f850290`): `mmq-load-tiles.cuh` and the `__vsub4`
 hunks in `vecdotq.cuh`/`fattn-common.cuh` are gone (upstream merged PR #29478), the `J_max`
 padding hunk in `mmq.cu`/`mmq.cuh` is gone (upstream reworked the MMQ padding to
@@ -202,14 +215,14 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 
 | File | Lines | Role in fork |
 |------|-------|--------------|
-| `ggml/src/ggml-cuda/repack-gcn.cu` | +2526 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery. ~90% of fork delta. |
-| `ggml/src/ggml-cuda/repack-gcn.cuh` | +57 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
+| `ggml/src/ggml-cuda/repack-gcn.cu` | +6610 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery + Q5_1/Q4_0/IQ repack + BF16-as-f16 upload; `lds_nc` column groups of 4 for NC 6..8 (`ffc7e39c1`). ~90% of fork delta. |
+| `ggml/src/ggml-cuda/repack-gcn.cuh` | +85 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
 | `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128` (`Q6_K I=64 occ2` after `2b620d7b9`), `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | +660 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`2b620d7b9`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row/one-wave matvecs, transpose dispatch, shared-expert fusion + guards, GLU re-enable. |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | +1177 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`2b620d7b9`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row matvecs + multi-nc, transpose dispatch, shared-expert fusion + guards, GLU re-enable; MoE weighted-reduction walk bounds + zero-token alloc deps (`5a2255fcc`, ported from mx-llama.cpp); bf16 -> f16 relabel (`d2685bff2`). |
 | `ggml/src/ggml-cuda/common.cuh` | +143/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`, `cuda_graph` `kernel_funcs` + `unstable_disabled` (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`2817c3c0d`). |
 | `ggml/src/ggml-cuda/add-id.cu` | +106/-11 | Turbo `float4` `vec4` + `contiguous` fast paths for `MoE` `ADD_ID` (`ne0%4` aligned). |
-| `ggml/src/ggml-cuda/rope.cu` | +10 | `GCN` `__sincosf`+`__logf` in `rope_yarn` (vs `cosf+sinf`). |
+| `ggml/src/ggml-cuda/rope.cu` | +90/-39 | `GCN` `__sincosf`+`__logf` in `rope_yarn`; round-2 `RMS_NORM_MUL_ROPE` M-RoPE fusion (`963dc1514` port, `ed4f655a6`); kernel SGPR slim - i32 strides + plain mul-modulo (`ffc7e39c1`), tg128 +0.9% on 0.8B BF16, validated 2026-11-06 |
 | `ggml/src/ggml-cuda/vecdotq.cuh` | +59 | `GCN` `memcpy` `b1/b2_fast`, `v_perm` `MXFP4` `8-entry`, `GGML_GCN_VEC_DOT_MXFP4` `Q8_0` fast. |
 | `ggml/src/ggml-cuda/mmq.cuh` | +19/-2 | Vega `MMQ` `GCN`/`__gfx906__` dispatch; `J_max` fallback padding (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | +17/-1 | Clamps `FATTN` `nstages=1` `occupancy=1` for `GCN` `64KB LDS`. |
@@ -221,15 +234,17 @@ upstream `rms_norm` dispatch and `ggml_cuda_fusion_disabled()` helper).
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
 | `ggml/src/ggml-cuda/concat.cu` | +78 | Tiled `dim-0` transpose path from furnace `19822e03a` (sixvolts + Claude Opus 5.5). |
 | `ggml/src/ggml-cuda/getrows.cu` | +49 | Short-row packing from furnace `596c95b54` (sixvolts + Claude Opus 5.5). |
-| `ggml/src/ggml-cuda/top-k.cu` | +33/-13 | Radix-select bin search from furnace `47e140b4d` (sixvolts + Claude Opus 5.5). |
+| `ggml/src/ggml-cuda/top-k.cu` | +171 net | Radix-select bin search from furnace `47e140b4d` (sixvolts + Claude Opus 5.5); round-2 deterministic column-order radix top-k (`01a6f0ce6`). |
 | `ggml/src/ggml-cuda/topk-moe.cu` | +44/-12 net | DPP argmax moves from furnace `0a2860296` (sixvolts + Claude Opus 5.5); rank kernel added then dropped (`4a8dee414`/`a9356d3ed`). |
 | `ggml/src/ggml-cuda/unary.cu` / `unary.cuh` | +21/+4 | `sigmoid_mul_add` kernel for shared-expert fusion from furnace `efdceeee4` (sixvolts + Claude Opus 5.5). |
 | `ggml/src/ggml-cuda/mmq.cu` | +13 | NVFP4 `y_scale` + `ids_dst` `+J_max` / `+128` padding for `J`-wide overread (`2b620d7b9`). |
-| `build-llamacpp-rocm.sh` | +27 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` `REPACK` isolation. |
-| `FORK_TRACKING.md` | +440 (new) | This doc. |
+| `build-llamacpp-rocm.sh` | +25 (new) | ROCm 7.2.4 `HIPCXX` `GFX906` isolation (the inert `-D REPACK` lines dropped in `961362c5c`). |
+| `MI50_ISA_OPTIMIZATION_NOTES.md` | +438 (new) | gfx906 ISA digest: verified hardware config, hazard tables, dot/packed ops, applied register/LDS fixes and audit backlog (sections 0-12). |
+| `amdgcn-audit.py` | +191 (new) | Per-kernel VGPR/SGPR/LDS audit from HIP code-object metadata in the build objects (no ROCm tooling or GPU needed). |
+| `FORK_TRACKING.md` | +774 (new) | This doc. |
 | `.gitignore` | +10 | `results.*` `rocprof` traces + `build-llamacpp-rocm.sh`. |
 | `src/llama-model.cpp` | +6/-4 | `make_gpu_buft_list` `extra_bufts` precedence + 2D→3D broadcast. |
-| `tests/test-backend-ops.cpp` | +8 | Substring `matches_filter` plus furnace `512`-expert topk cases (`4a8dee414`); per-commit kernel tests dropped to keep diff small. |
+| `tests/test-backend-ops.cpp` | +59 | Substring `matches_filter` plus furnace `512`-expert topk cases (`4a8dee414`); per-commit kernel tests dropped to keep diff small. |
 
 ---
 
@@ -444,7 +459,7 @@ commits (`671a00b66`, `f3d2967a5`) and the now-empty `d87a4cd04`.
 | `GGML_CUDA_REPACK_Q3_K` / `_Q4_K` / `_Q5_K` / `_Q6_K` | ON (`0`/`off`/`false`/`no` opts out) | Per-type K-quant repack switches (furnace `9a548180e` + `0c63b6968`). Q3_K is stored/run as Q6_K planes but the switch follows the tensor type: `_Q6_K=0` leaves Q3_K on the Q6_K kernels, `_Q3_K=0` does not touch Q6_K. `_Q4_K=0` also gives up the fused gate/up GLU decode. A non-repacked tensor runs the stock MMQ / mmvq path. |
 | `GGML_CUDA_REPACK_Q8_0` | ON for GCN since `961362c5c` (2026-11-05, `off` opts out); opt-in before | Spark-X2.6-4B-Q8_0 repacked pp512 `+57%` / tg128 `+6%` vs stock - the retuned decode kernels won, no retune pending anymore |
 | `GGML_CUDA_REPACK_Q5_1` | ON for GCN since `961362c5c` (`off` opts out); opt-in before | Q5_1 repack, K multiple of 32 (`qwen4exp ffn_down_exps` has K=640) |
-| `GGML_CUDA_REPACK_BF16` (WIP, uncommitted) | ON (`off` opts out); `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` also opts out | 2D MUL_MAT BF16 weights stored as f16 in the repack buffer (`set_tensor` converts bf16 -> f16 row-major); `ggml_cuda_mul_mat` relabels BF16 -> F16 (thread_local tensor) so the stock f16 mmvf/Hgemm path runs. `token_embd` unaffected (loader probe maps it to GET_ROWS, which the repack buft gate rejects, so it stays in the default buffer). |
+| `GGML_CUDA_REPACK_BF16` | ON, committed `d2685bff2` (`off` opts out); `GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` also opts out | 2D MUL_MAT BF16 weights stored as f16 in the repack buffer (`set_tensor` converts bf16 -> f16 row-major); `ggml_cuda_mul_mat` relabels BF16 -> F16 (thread_local tensor) so the stock f16 mmvf/Hgemm path runs. `token_embd` unaffected (loader probe maps it to GET_ROWS, which the repack buft gate rejects, so it stays in the default buffer). |
 | `GGML_CUDA_REPACK_MOE=0/1` | OFF until `349128ba3` | Q4_K/Q5_K half-block MoE path |
 | `GGML_CUDA_REPACK_NO_MMQ=1` | unset | Force dequant+GemmEx fallback for `ne11>1` repacked |
 | `REPACK_TRACE=1` | unset | Log `mul_mat` dispatch shapes |
@@ -489,6 +504,7 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 | FATTN GCN native `q8_0` tile | Fork-only; GCN 64KB LDS compact vs `f16` shadow | Keep; `GGML_USE_HIP` gated, validated via `ggml_cuda_fattn_use_native_tile` probe |
 | Vega20 MMQ table | Derived from RDNA2 occupancy 1; `Q6_K I=64 occ2` after `2b620d7b9` (`+4.2%` PP) | Keep; upstream MMQ tables live in `mmq.cuh` and change often - rebase conflict expected |
 | DPP warp reductions | GCN-only `#ifdef`; no CDNA/RDNA impact | Keep; re-check if upstream refactors `common.cuh` reductions |
+| `MoE` weighted-reduction empty-tail | Fixed here `5a2255fcc` (node-walk bounds + zero-token alloc deps, ported from mx-llama.cpp `ef7246cd9`) | Check if upstream still walks past `n_nodes` on empty last-layer chains; PR if missing - see `ggml-cuda.cu:3968` |
 
 ---
 
@@ -518,9 +534,9 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 ```
 upstream/master (ggml-org)  ──────────────────────►  7951f601e  (2026-10-19, current base)
 origin/master (this repo)      ──────────────────────►  7951f601e  (synced, no fork commits)
-origin/gfx906/mi50-optimization  ─── 4364bf723 ──► 87f850290  (published HEAD, pre-rebase)
-backup/mi50-pre-rebase-20261018  ─── 4364bf723 ──► 87f850290  (same as published)
-local gfx906/mi50-optimization   ─── 7951f601e ──► 83 commits ──► HEAD (rebased 2026-10-19)
+origin/gfx906/mi50-optimization  ─── 7951f601e ──► d2685bff2  (published, 2026-11-05; 5a2255fcc..ffc7e39c1 unpushed)
+backup/mi50-pre-rebase-20261018  ─── 4364bf723 ──► 87f850290  (same as pre-rebase backup)
+local gfx906/mi50-optimization   ─── 7951f601e ──► 98 commits ──► ffc7e39c1 + docs
 ```
 
 ---
@@ -696,15 +712,15 @@ Validation (2026-11-05, 1x MI50 gfx906, ROCm 7.2.4, `Spark-X2.6-4B-Q8_0`):
 
 ---
 
-## BF16 -> F16 Upload Conversion Repack (WIP, uncommitted 2026-11-05)
+## BF16 -> F16 Upload Conversion Repack (2026-11-05, committed `d2685bff2`)
 
 Design: gfx906 has no bf16 compute, so the stock path dequantizes bf16 weights to f32 and runs Sgemm at half the
 packed-f16 rate. 2D MUL_MAT BF16 weights are stored in the repack buffer as f16 instead: `set_tensor` converts
 bf16 -> f16 row-major (`repack_bf16_as_f16_host`, same 2 bytes, no interleave) and `ggml_cuda_mul_mat` relabels
 the tensor BF16 -> F16 so the stock f16 mmvf/Hgemm path runs. Opt-outs: `GGML_CUDA_REPACK_BF16=off` and
-`GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` (that env would read the f16 bits as bf16). Uncommitted delta:
-`repack-gcn.cu` +21 (`nbytes`/`supported`/`set_tensor` cases), `ggml-cuda.cu` +31/-3 (relabel + `REPACK_BF16_DEBUG`
-dispatch prints).
+`GGML_CUDA_CUBLAS_COMPUTE_TYPE=bf16` (that env would read the f16 bits as bf16). Committed as
+`d2685bff2`: `repack-gcn.cu` +21 (`nbytes`/`supported`/`set_tensor` cases), `ggml-cuda.cu` +31/-3
+(relabel + `REPACK_BF16_DEBUG` dispatch prints).
 
 Bench (1xMI50, ROCm 7.2.4, `llama-bench -p512 -n128 -r3`, Qwen3.5-0.8B BF16):
 | run | pp512 | tg128 |
@@ -749,6 +765,56 @@ empty tensor name from one of these copies, treat it as this bug first:
   proves whether the copy ever stored.
 - Rule for future ports: do not put a `ggml_tensor` copy on the call frame when a pointer to it is passed to
   another function; use `static thread_local`, heap, or mutate/restore in place.
+
+---
+
+## ISA Notes + Kernel Register Audit (2026-11-06, `2aa788490`)
+
+`MI50_ISA_OPTIMIZATION_NOTES.md` (committed) distills the "Vega" 7nm ISA doc and the verified
+MI50 hardware config; `amdgcn-audit.py` (committed) reads per-kernel VGPR/SGPR/LDS and spill
+counts from the HIP code-object metadata inside the built `.o` files - no ROCm tooling or GPU
+needed, occupancy math `min(10, 1024/VGPR, 800/SGPR)` + `floor(64 KiB / LDS_per_wg)`.
+
+Audit findings (notes sec. 11): `flash_attn_tile` dkq128/J>=8 spills ~900 dword (J<=4: 5-12);
+`gcn_f32_matvec_rows_multi_nc<7..16>` V256 + spill up to 394; `rms_norm_mul_rope` SGPR 100 +
+spill 15-20; `lds_nc<6>/<8>` occupancy co-bound by LDS (6912/9212 B), so VGPR-only shaving was
+a dead end.
+
+### lds_nc column-group + rope SGPR slim: committed `ffc7e39c1`, validated 2026-11-06
+
+Both changes are output-preserving restructures. The in-tree `libggml-hip` was built after the
+edits (library 17:44 vs sources 17:38), so every run below includes them; no separate rebuild or
+`amdgcn-audit.py` re-audit was done - run the two audit commands in notes sec. 12 to confirm
+the register/LDS expectations.
+
+| File | Change | Result |
+|---|---|---|
+| `repack-gcn.cu` | `lds_nc` column groups of 4 for NC = 6..8 (LDS 6912/9216 -> 4608 B, live acc 16; NC <= 5 single-pass unchanged). Per (row, column) K order unchanged - bit-identical; pass 2 re-reads weight halves as L2 hits | validated: batched-bench B=8 TG `326.3-328.0` vs per-column fallback `254-268` (+22%); B=2..4 match the recorded refs within noise; B=6 dips (`~271-275`: group 4+2 leaves 25% dead slots, below B=4's `295`) - pack concurrent slots to multiples of 4, best 8 |
+| `rope.cu` | `rms_norm_mul_rope`: x/mul/dst strides -> i32 (2^31-element asserts in the fused entry), per-channel mul dims -> plain `%` (per-element fastdiv kept). Bit-identical | validated: 0.8B BF16 tg128 `197.65 +/- 0.91` on vs `195.95 +/- 0.93` fusion-off (+0.9%); 48-token greedy text identical; SGPR audit still pending |
+
+Validation (2026-11-06, 1x MI50 gfx906, ROCm 7.2.4, build `2aa788490` + WIP):
+
+- `test-backend-ops -o MUL_MAT` 240/240 OK; `-o RMS_NORM_MUL_ROPE` OK.
+- `Spark-X2.6-4B-Q8_0` wikitext `-c 512 --chunks 4`: chunk PPL bit-identical across rope fusion
+  on/off (`GGML_CUDA_NO_NORM_MROPE_FUSION`), staged vs per-column fallback (`GGML_CUDA_NO_Q8_LDS_NC`
+  / `GGML_CUDA_NO_Q8_LDS_ROWS`), and `-b 512` (n_seq=1) vs `-b 2048` (n_seq=4): `39.2040, 24.5763,
+  19.8034, 20.9564`. The pooled `--chunks 2` ref `24.5763` from `e80a06d39` reproduces bit-exactly.
+- The old 4-chunk list (`38.9503, 24.4469, 19.7742, 20.9448`) is not digit-exact anymore: the
+  perplexity tool's Final/pooling semantics changed since the 2026-11-05 validation ("Final
+  estimate" now prints the last chunk's value) - tooling artifact, not a WIP signal (all
+  invariance toggles on this build are bit-identical).
+- `llama-bench -ngl 99 -p512 -n128 -r5`: `Spark-X2.6-4B-Q8_0` pp512 `2165.48 +/- 39.63` / tg128
+  `120.93 +/- 1.46` (recorded `2127.86 +/- 50.99` / `118.96 +/- 0.51`); `Qwen3.5-0.8B-BF16` pp512
+  `6516.33 +/- 501.34` (vs `4785.28 +/- 330.75`; the prefill jump is the committed bf16 repack, not
+  this WIP), tg128 `197.65 +/- 0.91` (vs `194.60`).
+- `llama-batched-bench -npp 128 -ntg 128 -ub 512 -c 4096` TG t/s: B2 `200.37` (ref `199.24`), B3
+  `266.64` (ref `262.74`), B4 `295.65` (ref `295.09`); new: B6 `271-275`, B7 `280-305`, B8
+  `326.3-328.0`. `GGML_CUDA_NO_Q8_LDS_NC=1` (per-column fallback): B6 `265-266`, B7 `262-266`,
+  B8 `254-268`.
+- Open: B=6/7 vs the pre-WIP single-pass `lds_nc<6>/<7>` needs a pre-WIP `.so` A/B (rebuild
+  declined); the env-fallback numbers above are the available bound. Also seen while benching:
+  `llama-batched-bench` OOMs unless `-c` is pinned (default context allocates ~36 GB at N_KV for
+  8 sequences), and `GFXPROF=1` aborts in `llama-cli` (pre-existing tooling issue, untouched).
 
 ---
 

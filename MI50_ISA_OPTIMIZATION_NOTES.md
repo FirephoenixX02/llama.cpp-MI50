@@ -404,7 +404,7 @@ Key findings (full dumps in `/tmp/audit_main.txt`, `/tmp/audit_ti.txt` at audit 
 | `flash_attn_tile` dkq96 / dkq256, J>=8 | spill 140-265 dwords | Same direction, smaller. |
 | `gcn_f32_matvec_rows_multi_nc<16>` (furnace port, ggml-cuda.cu) | V256 + spill up to 394; nc=7..16 spill 38-394; nc<=6 clean, 10 waves at V<=64 | Concurrent-decode F32 matvec spills. Shave per-thread accumulators or split work; nc<=6 variant is fine. |
 | `rms_norm_mul_rope_f32` (round-2 M-RoPE fusion) | SGPR 100 + SGPR spill 15-20, W8 | SGPR spill = scratch scratchpad traffic on a per-token hot kernel. Pack the nine 64-bit args / offsets; target <= 80 SGPR (10 waves, no spill). |
-| `mul_mat_vec_q8_0_repacked_lds_nc<6>` / `<8>` | V105 / V122 -> 9 / 8 waves | Shave 5 / 22 VGPRs -> back over the 100 cliff to 10 waves, on the 6-8 slot concurrent-decode Q8_0 path. |
+| `mul_mat_vec_q8_0_repacked_lds_nc<6>` / `<8>` | V105 / V122, but occupancy co-bound by LDS: 6912 B / 9216 B -> 9 / 7 WGs per CU, so VGPR shaving alone cannot reach 10 waves | Fix needs LDS shrink + VGPR cut together: apply the column-group restructure (GC = 4 for NC = 6..8; NC <= 5 was already at 10 waves and stays single-pass). Applied and validated 2026-11-06 (bench + bit-exact PPL; audit re-run still pending). |
 | `mmq_gemm_*_repacked` (prefill GEMM) | V115-128, spill 2-3 dwords on several; LDS 12.3-25.6 KB (2 WG/CU at >= 16 KB) | Spills are trivial to eliminate (few regs). VGPR cliffs don't matter here - LDS keeps them at 2 WG/CU; the knob is LDS per WG, not VGPR, on these. |
 | canonical MMQ instances (q1_0/q2_0/q2_k J=64) | V211-256, some spill (e.g. q2_k J64 B1: 394) | Check which J values the Vega table actually dispatches before optimizing; the spilling ones are dead weight if never launched. |
 | `mul_mat_vec_q` MXFP4 ncols 5-8 | V132-201, 5-7 waves | Only matters for MXFP4 models; would need per-thread acc reduction. |
@@ -414,6 +414,58 @@ Caveats: dynamic-LDS kernels (canonical MMQ) report LDS 0 in metadata - the real
 from the config table at launch, so occupancy there is config-bound first. Spill units come
 from the runtime metadata (`vgpr_spill_count` semantics vary by code-object version; treat
 >0 as bad, magnitude relative between variants).
+
+## 12. Applied register/LDS fixes (2026-11-06, committed `ffc7e39c1`, validated; re-audit pending)
+
+Both changes are output-preserving restructures (no kernel dispatch, layout or math-order
+change):
+
+1. `repack-gcn.cu` `mul_mat_vec_q8_0_repacked_lds_nc`: column groups of 4 for NC = 6..8.
+   Each group stages its own activation chunk in LDS (sxq/sxd arrays shrink to GC),
+   accumulates ROWS x GC and reduces/stores before the next group starts. Per (row, column)
+   the K-chunk order is unchanged (each pair accumulates the same h0 sequence), warp_reduce
+   runs once per output, so results are bit-identical. Cost: the second pass re-reads the
+   weight halves - those are just-written and should hit L2; bench decides. NC <= 5 keeps
+   the original single-pass shape.
+2. `rope.cu` `rms_norm_mul_rope_f32`: x/mul/dst strides narrow to i32 (guarded by
+   2^31-element asserts in `ggml_cuda_op_rms_norm_mul_rope_fused` - activations on a
+   16 GiB card stay far below), per-channel mul dims pass plain uints and use hardware
+   modulo (3 int divisions per channel per block, cold) while the per-element
+   `mul_ncols_packed` fastdiv stays. Expected: SGPR 100 -> ~85-88, SGPR spill gone;
+   occupancy 8 -> 9 waves if SGPR <= 84.
+
+Verify chain (host):
+
+```sh
+cmake --build build -j$(nproc) --target ggml-hip
+python3 amdgcn-audit.py 'build/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/*.o' lds_nc
+python3 amdgcn-audit.py 'build/ggml/src/ggml-hip/CMakeFiles/ggml-hip.dir/__/ggml-cuda/*.o' rms_norm_mul_rope
+.
+# then: test-backend-ops -o MUL_MAT and -o RMS_NORM_MUL_ROPE, batched-bench, wikitext PPL
+```
+
+Audit expectations after rebuild: `lds_nc<6>` / `<8>` LDS 4608, VGPR <= ~104, 10 waves
+(if VGPR still > 104, the next shave is inside the group pass); `rms_norm_mul_rope`
+S ~ 88, spill 0. If the lds_nc bench regresses (the weight L2 re-reads), revert just the
+repack-gcn.cu hunk.
+
+### Results (2026-11-06, in-tree build; details in FORK_TRACKING)
+
+No rebuild ran, so the audit expectations above are still unconfirmed - run the two audit
+commands at the next rebuild. What was validated on the built tree:
+
+- Regression: `test-backend-ops -o MUL_MAT` 240/240 OK; `-o RMS_NORM_MUL_ROPE` OK.
+- Bit-exactness: `Spark-X2.6-4B-Q8_0` chunk PPL unchanged (`39.2040, 24.5763, 19.8034, 20.9564`)
+  with the rope fusion toggled off (`GGML_CUDA_NO_NORM_MROPE_FUSION`) and with both staged-nc
+  toggles back at the per-column fallback (`GGML_CUDA_NO_Q8_LDS_NC` / `NO_Q8_LDS_ROWS`); the
+  pooled `--chunks 2` value `24.5763` matches the recorded `e80a06d39` ref. Greedy 48-token
+  text on `Qwen3.5-0.8B-BF16` identical with/without the fused rope.
+- Perf: rope kernel tg128 +0.9% (0.8B BF16 `197.65 +/- 0.91` on vs `195.95 +/- 0.93` off, r5).
+  batched-bench 128/128 ub512 `-c 4096`: B=8 TG `326.3-328.0` vs fallback `254-268` (+22%);
+  B=2..4 match the recorded refs within noise. B=6 (`271-275`) is the weak slot - group 4+2
+  wastes 25% of the column slots and B=6 lands below B=4 (`295`): keep concurrent slots at
+  multiples of 4, best 8.
+- Open: B=6/7 vs the pre-WIP single-pass kernel (needs a pre-WIP `.so` A/B); the audit runs.
 
 
 
