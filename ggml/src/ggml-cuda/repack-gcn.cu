@@ -4792,13 +4792,20 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_multi_nc
 // L1). Rows of the grouped matrices sit back to back (q8_multi_args); a wave's ROWS rows never
 // straddle a matrix (the launcher requires ne1 % ROWS == 0). Per (row, column) the lane sums run in
 // the same order as mul_mat_vec_q8_0_repacked_nc, so results are identical.
+// NC > 4 is processed in column groups of 4: each group stages and reduces on its own, capping the
+// live accumulator count and the LDS footprint (the extra passes re-read the weight halves, mostly
+// as L2 hits); the per (row, column) K-chunk order is unchanged, so results stay identical.
 // Ported from furnace gfx906-perf 69db7bf5d (sixvolts + Claude Fable 5.1).
 template <int NC, int ROWS>
 static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_lds_nc(
         const q8_multi_args args, const block_q8_1 * __restrict__ xq, const uint32_t ne0, const uint32_t x_stride) {
 #if defined(GGML_USE_HIP) && defined(GCN)
-    __shared__ int4  sxq[NC][32][2];
-    __shared__ float sxd[NC][32];
+    // column groups keep the live accumulator count low on wave64; only NC = 6..8 needs
+    // the split (ceil(NC/4) passes, second pass re-reads the weight halves as L2 hits),
+    // NC <= 5 was already at 10 waves and keeps the single pass
+    constexpr int GC = NC <= 5 ? NC : 4;
+    __shared__ int4  sxq[GC][32][2];
+    __shared__ float sxd[GC][32];
     const int lane = threadIdx.x % 64;
     const int wave = threadIdx.x / 64;
     const uint32_t grow0 = blockIdx.x * (4 * ROWS) + wave * ROWS;
@@ -4812,64 +4819,71 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_q8_0_repacked_lds_nc(
     const uint16_t * d_plane = reinterpret_cast<const uint16_t *>(args.w[t] + (size_t) ne1 * nsp * 32);
     const uint32_t n_half = n_blocks * 2;
 
-    float acc[ROWS][NC];
+    for (int c0 = 0; c0 < NC; c0 += GC) {
+        float acc[ROWS][GC];
 #pragma unroll
-    for (int r = 0; r < ROWS; ++r) {
+        for (int r = 0; r < ROWS; ++r) {
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            acc[r][c] = 0.0f;
+            for (int lc = 0; lc < GC; ++lc) {
+                acc[r][lc] = 0.0f;
+            }
         }
-    }
 
-    for (uint32_t h0 = 0; h0 < n_half; h0 += 64) {
-        const uint32_t sb0 = h0 >> 1;
-        __syncthreads();
-        for (int e = threadIdx.x; e < NC * 32; e += 256) {
-            const int c = e / 32, l = e % 32;
-            const uint32_t sb = sb0 + l;
-            if (sb < n_blocks) {
-                const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
-                const int4 * q = reinterpret_cast<const int4 *>(xb->qs);
-                sxq[c][l][0] = q[0];
-                sxq[c][l][1] = q[1];
-                sxd[c][l]    = __low2float(xb->ds);
+        for (uint32_t h0 = 0; h0 < n_half; h0 += 64) {
+            const uint32_t sb0 = h0 >> 1;
+            __syncthreads();
+            for (int e = threadIdx.x; e < GC * 32; e += 256) {
+                const int lc = e / 32, l = e % 32;
+                const int c = c0 + lc;
+                const uint32_t sb = sb0 + l;
+                if (c < NC && sb < n_blocks) {
+                    const block_q8_1 * xb = xq + (size_t) c * x_stride + sb;
+                    const int4 * q = reinterpret_cast<const int4 *>(xb->qs);
+                    sxq[lc][l][0] = q[0];
+                    sxq[lc][l][1] = q[1];
+                    sxd[lc][l]    = __low2float(xb->ds);
+                }
             }
-        }
-        __syncthreads();
-        const uint32_t hb = h0 + lane;
-        if (wave_ok && hb < n_half) {
-            const uint32_t sb = hb >> 1, half = hb & 1;
-            const int l = lane >> 1;
-            int4  w[ROWS];
-            float dw[ROWS];
-#pragma unroll
-            for (int r = 0; r < ROWS; ++r) {
-                const uint32_t row = row0 + r;
-                w[r] = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
-                const uint16_t db = d_plane[(size_t) row * nsp + sb];
-                dw[r] = __half2float(*reinterpret_cast<const __half *>(&db));
-            }
-#pragma unroll
-            for (int c = 0; c < NC; ++c) {
-                const int4  a  = sxq[c][l][half];
-                const float dx = sxd[c][l];
+            __syncthreads();
+            const uint32_t hb = h0 + lane;
+            if (wave_ok && hb < n_half) {
+                const uint32_t sb = hb >> 1, half = hb & 1;
+                const int l = lane >> 1;
+                int4  w[ROWS];
+                float dw[ROWS];
 #pragma unroll
                 for (int r = 0; r < ROWS; ++r) {
-                    int idot = 0;
-                    idot = ggml_cuda_dp4a(w[r].x, a.x, idot); idot = ggml_cuda_dp4a(w[r].y, a.y, idot);
-                    idot = ggml_cuda_dp4a(w[r].z, a.z, idot); idot = ggml_cuda_dp4a(w[r].w, a.w, idot);
-                    acc[r][c] += dw[r] * dx * (float) idot;
+                    const uint32_t row = row0 + r;
+                    w[r] = *reinterpret_cast<const int4 *>(qs_int + ((size_t) row * nsp + sb) * 8 + half * 4);
+                    const uint16_t db = d_plane[(size_t) row * nsp + sb];
+                    dw[r] = __half2float(*reinterpret_cast<const __half *>(&db));
+                }
+#pragma unroll
+                for (int lc = 0; lc < GC; ++lc) {
+                    if (c0 + lc < NC) {
+                        const int4  a  = sxq[lc][l][half];
+                        const float dx = sxd[lc][l];
+#pragma unroll
+                        for (int r = 0; r < ROWS; ++r) {
+                            int idot = 0;
+                            idot = ggml_cuda_dp4a(w[r].x, a.x, idot); idot = ggml_cuda_dp4a(w[r].y, a.y, idot);
+                            idot = ggml_cuda_dp4a(w[r].z, a.z, idot); idot = ggml_cuda_dp4a(w[r].w, a.w, idot);
+                            acc[r][lc] += dw[r] * dx * (float) idot;
+                        }
+                    }
                 }
             }
         }
-    }
 #pragma unroll
-    for (int r = 0; r < ROWS; ++r) {
+        for (int r = 0; r < ROWS; ++r) {
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            const float v = warp_reduce_sum<64>(acc[r][c]);
-            if (wave_ok && lane == 0) {
-                args.y[t][(size_t) c * ne1 + row0 + r] = v;
+            for (int lc = 0; lc < GC; ++lc) {
+                if (c0 + lc < NC) {
+                    const float v = warp_reduce_sum<64>(acc[r][lc]);
+                    if (wave_ok && lane == 0) {
+                        args.y[t][(size_t) (c0 + lc) * ne1 + row0 + r] = v;
+                    }
+                }
             }
         }
     }
