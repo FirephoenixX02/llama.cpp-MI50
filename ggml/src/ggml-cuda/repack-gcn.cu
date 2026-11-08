@@ -7,6 +7,7 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 #include "ggml-quants.h"
+#include <algorithm>
 #include <vector>
 #include <cctype>
 #include <cmath>
@@ -648,6 +649,32 @@ static __global__ void __launch_bounds__(1024, 1) repack_tile_map(
     }
     if (t == 0) {
         tile_off[n_expert] = carry;
+    }
+}
+
+// mm_ids_helper no longer emits expert_bounds. Rebuild it from the compact
+// routing: count each assignment's expert, then turn the counts into the
+// exclusive prefix sum the tile map expects.
+static __global__ void repack_expert_histogram(
+        const int32_t * __restrict__ ids, const int32_t * __restrict__ ids_dst,
+        int32_t * __restrict__ expert_bounds, const int si1, const int n_expert_used,
+        const int n_assign, const int n_expert) {
+    for (int a = blockIdx.x * blockDim.x + threadIdx.x; a < n_assign; a += gridDim.x * blockDim.x) {
+        const int d   = ids_dst[a];
+        const int it  = d / n_expert_used;
+        const int iex = d - it * n_expert_used;
+        const int e   = ids[it * si1 + iex];
+        if (e >= 0 && e < n_expert) {
+            atomicAdd(&expert_bounds[e + 1], 1);
+        }
+    }
+}
+
+static __global__ void repack_expert_bounds_scan(int32_t * __restrict__ expert_bounds, const int n_expert) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int e = 1; e <= n_expert; ++e) {
+            expert_bounds[e] += expert_bounds[e - 1];
+        }
     }
 }
 
@@ -5904,11 +5931,18 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     ggml_cuda_pool_alloc<int32_t> tile_off(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> tile_expert(ctx.pool());
     ggml_cuda_pool_alloc<char>    src1_q8_1(ctx.pool());
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool());
+    ggml_cuda_mm_id_tile_spec * p_tile_spec = nullptr;
 
     auto route = [&](int32_t * s1, int32_t * d, int32_t * b, int32_t * to, int32_t * te) {
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, s1, d, b,
-            ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, s1, d, p_tile_spec,
+            ne02, n_tokens, n_expert_used, src1->ne[1], 16 * TN_ID, si1, sis1, /*write_inverse =*/ false, stream);
         CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemsetAsync(b, 0, (ne02 + 1) * sizeof(int32_t), stream));
+        const int hist_blocks = (int) std::min<int64_t>((n_assign + 255) / 256, 1024);
+        repack_expert_histogram<<<hist_blocks, 256, 0, stream>>>(
+            (const int32_t *) ids->data, d, b, si1, (int) n_expert_used, (int) n_assign, (int) ne02);
+        repack_expert_bounds_scan<<<1, 1, 0, stream>>>(b, ne02);
         repack_tile_map<16 * TN_ID><<<1, 1024, 0, stream>>>(b, to, te, ne02);
     };
 
@@ -5958,6 +5992,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 p_tile_off    = tile_off.alloc(ne02 + 1);
                 p_tile_expert = tile_expert.alloc(max_tiles);
             }
+            p_tile_spec = tile_spec.alloc(max_tiles + 1);
             route(p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert);
         }
 
@@ -5970,6 +6005,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             p_bounds      = expert_bounds.alloc(ne02 + 1);
             p_tile_off    = tile_off.alloc(ne02 + 1);
             p_tile_expert = tile_expert.alloc(max_tiles);
+            p_tile_spec   = tile_spec.alloc(max_tiles + 1);
             route(p_ids_src1, p_ids_dst, p_bounds, p_tile_off, p_tile_expert);
         }
         // quantize all activation columns once, natural order

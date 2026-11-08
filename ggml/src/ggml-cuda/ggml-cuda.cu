@@ -3809,8 +3809,11 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph * graph, size_t id
             CUDA_CHECK(hipGraphKernelNodeGetParams(nodes[i], &p));
             funcs.push_back(p.func);
         }
-        funcs_changed = funcs != graph->kernel_funcs;
-        graph->kernel_funcs = std::move(funcs);
+        if (graph->kernel_funcs.size() <= idx) {
+            graph->kernel_funcs.resize(idx + 1);
+        }
+        funcs_changed = funcs != graph->kernel_funcs[idx];
+        graph->kernel_funcs[idx] = std::move(funcs);
     }
     if (funcs_changed) {
         GGML_LOG_DEBUG("%s: HIP: kernel set changed, re-instantiating graph exec\n", __func__);

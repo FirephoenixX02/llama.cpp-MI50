@@ -1417,9 +1417,9 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
-    // kernel functions of the last capture, to detect function changes that
-    // hipGraphExecUpdate would apply without validating launch geometry
-    std::vector<const void *> kernel_funcs;
+    // kernel functions of the last capture per chunk, to detect function changes
+    // that hipGraphExecUpdate would apply without validating launch geometry
+    std::vector<std::vector<const void *>> kernel_funcs;
     // graphs never amortize for entries whose properties keep changing
     // (spec decode churns shapes and KV pointers) - they self-disable
     int n_prop_checks = 0;
