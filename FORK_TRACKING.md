@@ -10,13 +10,13 @@
 | **Fork repo** | `https://github.com/FirephoenixX02/llama.cpp-MI50` |
 | **Upstream** | `https://github.com/ggml-org/llama.cpp` |
 | **Fork branch (published)** | `origin/gfx906/mi50-optimization` at `d2685bff2` (2026-11-05, bf16 repack); `5a2255fcc` / `2aa788490` / `ffc7e39c1` + docs commit not yet pushed |
-| **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `7951f601e` (2026-10-19), 99 commits ahead, clean |
-| **Base / merge-base** | `7951f601e` - `vendor : update cpp-httplib to 0.62.0 (#30785)` |
-| **Base date** | 2026-10-19 |
+| **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `a691b2345` (2026-11-08), 99 commits ahead, clean |
+| **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
+| **Base date** | 2026-11-08 |
 | **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-06 (lds_nc column-group restructure + rms_norm_mul_rope SGPR slim committed `ffc7e39c1` and validated same day, see "lds_nc column-group + rope SGPR slim" below; fork-tracking trimmed - early rounds compressed to tables, per-port tables deduplicated against the Commit Inventory) |
-| **Upstream `origin/master`** | `7951f601e` (2026-10-19) - rebase done, see "Rebase 2026-10-19" below |
-| **Backup** | `backup/mi50-pre-rebase-20261018` at `87f850290` (pre-rebase HEAD) |
+| **Last doc update** | 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten) |
+| **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
+| **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
 
 ### How to refresh this snapshot
@@ -155,11 +155,11 @@ Key pillars:
 
 ---
 
-## File-level Impact (vs `7951f601e`)
+## File-level Impact (vs `a691b2345`)
 
-Raw: 34 files, 11804 insertions(+), 200 deletions(-) vs `origin/master` (2026-11-06; full
+Raw: 34 files, 11704 insertions(+), 200 deletions(-) vs `origin/master` (2026-11-08; full
 per-file listing via `git diff --stat origin/master..HEAD`). The 11 furnace ports that were
-uncommitted on 2026-10-05 are a single commit (`5e601af03`).
+uncommitted on 2026-10-05 are a single commit (`5e601af03` in the pre-rebase history).
 
 Since 2026-11-05: the BF16 repack WIP landed as `d2685bff2` (`repack-gcn.cu` 6383 -> 6596,
 `ggml-cuda.cu` relabel + guard), the MoE weighted-reduction guard is `5a2255fcc`
@@ -282,6 +282,60 @@ expected conflict files for the next rebase: see Rebase / Merge Checklist.
 
 ---
 
+## Rebase 2026-11-08 (onto upstream master `a691b2345`)
+
+Rebased the 99-commit stack from `7951f601e` onto `a691b2345` (468 upstream commits). All branch
+SHAs were rewritten; `git log --reverse --oneline a691b2345..HEAD` is authoritative. Backup of the
+pre-rebase tip: `backup/mi50-pre-rebase-20261108` at `270fc1275`.
+
+Conflicts resolved:
+
+- `ggml-cuda.cu` include block: keep upstream `top-k-mask.cuh` and the guarded
+  `gfx906-mi50-opts.cuh` include.
+- `ggml-cuda.cu` HIP graph guard: upstream split graph capture into chunks
+  (`ggml_cuda_graph::instances`, `ggml_cuda_graph_launch_chunk`). The guard now operates per chunk
+  (`ggml_cuda_graph_update_executable(graph, idx, cuda_graph)`), and `kernel_funcs` became a vector
+  of per-chunk vectors.
+- `unary.cuh`: keep upstream `ggml_cuda_op_glu_single` switch and add the fork
+  `ggml_cuda_op_sigmoid_mul_add` declaration.
+- `tests/test-backend-ops.cpp`: keep both upstream 384-expert top-k cases and the fork 512-expert
+  cases; keep upstream `yarn`/`truncate` RMS_NORM_MUL_ROPE fields plus the fork `rope_dims`.
+- `ggml-cuda.cu` RMS_NORM+MUL+ROPE: upstream already accepts M-RoPE/IMRoPE in
+  `ggml_cuda_should_fuse_rope_set_rows`; keep that mode check (the fork env gate remains in
+  `ggml_cuda_should_fuse_rms_norm_mul_rope`).
+
+Code adaptations required by upstream API changes (not conflicts):
+
+- `mmid.cu` now emits `ggml_cuda_mm_id_tile_spec` instead of `expert_bounds`.
+  `ggml_cuda_mul_mat_id_repacked` passes a `tile_spec` buffer and the 16-wide tile width, then
+  rebuilds `expert_bounds` from the compact routing (`repack_expert_histogram` +
+  `repack_expert_bounds_scan`) before running the existing `repack_tile_map`; the routed MMQ kernels
+  are unchanged. The tail specs cannot be used for bounds: the helper mutates `col_low` while
+  emitting seam tiles.
+
+Validation (1x MI50 gfx906, ROCm 7.2.4, `build-llamacpp-rocm.sh` clean):
+
+- `test-backend-ops -b ROCm0 -o MUL_MAT,MUL_MAT_ID,RMS_NORM,RMS_NORM_MUL_ROPE,ROPE,TOPK,ADD,FLASH_ATTN_EXT,GET_ROWS,UNARY,SOFT_MAX`:
+  9193/9193 tests passed, 2/2 backends passed.
+- `llama-bench -ngl 99 -p 512 -n 128 -r 3`, upstream `a691b2345` vs this branch, same session,
+  both built with `build-llamacpp-rocm.sh`:
+
+  | Model | master pp512 | fork pp512 | pp delta | master tg128 | fork tg128 | tg delta |
+  |-------|-------------:|-----------:|---------:|-------------:|-----------:|---------:|
+  | Qwen3.5-9B UD-Q4_K_XL | 793.34 +/- 3.18 | 987.92 +/- 31.66 | +24.5% | 67.60 +/- 0.22 | 83.06 +/- 0.14 | +22.9% |
+  | Qwen3.5-0.8B BF16 | 4386.02 +/- 59.30 | 6635.71 +/- 115.05 | +51.3% | 184.87 +/- 0.35 | 198.32 +/- 0.28 | +7.3% |
+  | Spark-X2.6-4B-Q8_0 | 1370.77 +/- 13.52 | 2149.44 +/- 12.02 | +56.8% | 110.43 +/- 0.08 | 121.52 +/- 0.27 | +10.0% |
+
+  These are the same gains as before the rebase (pre-rebase fork 963.0/83.2, 4767.3/190.4),
+  so the 2026-11-08 base did not regress the fork optimizations.
+- `llama-perplexity -c 512 --chunks 2` (wikitext-2, chunk PPL): Ling-3.0-tiny Q8_0 MoE repack on
+  `8.1083, 12.4490` vs `GGML_CUDA_REPACK=0` `8.0729, 12.5455`; Spark-X2.6-4B Q8_0 repack on
+  `39.2040, 24.5763` vs off `39.2735, 24.6055`. This MoE check is what caught the first
+  `expert_bounds` reconstruction attempt (tail-spec `col_low` is mutated by the seam loop; PPL
+  blew up to 255).
+
+---
+
 ## Correctness Notes
 
 - All repacked matvec/MMQ variants validated via `wikitext PPL` vs GEMM/canonical within noise (tokens in commit logs).
@@ -380,11 +434,12 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 ## Branch Topology
 
 ```
-upstream/master (ggml-org)  ──────────────────────►  7951f601e  (2026-10-19, current base)
-origin/master (this repo)      ──────────────────────►  7951f601e  (synced, no fork commits)
-origin/gfx906/mi50-optimization  ─── 7951f601e ──► d2685bff2  (published, 2026-11-05; 5a2255fcc..ffc7e39c1 unpushed)
-backup/mi50-pre-rebase-20261018  ─── 4364bf723 ──► 87f850290  (same as pre-rebase backup)
-local gfx906/mi50-optimization   ─── 7951f601e ──► 99 commits ──► ffc7e39c1 + docs
+upstream/master (ggml-org)  ──────────────────────►  a691b2345  (2026-11-08, current base)
+origin/master (this repo)      ──────────────────────►  a691b2345  (synced, no fork commits)
+origin/gfx906/mi50-optimization  ─── 7951f601e ──► d2685bff2  (published, 2026-11-05; rest unpushed)
+backup/mi50-pre-rebase-20261018  ─── 4364bf723 ──► 87f850290  (older pre-rebase backup)
+backup/mi50-pre-rebase-20261108  ─── 7951f601e ──► 270fc1275  (tip before the 2026-11-08 rebase)
+local gfx906/mi50-optimization   ─── a691b2345 ──► 99 commits + rebase fixups
 ```
 
 ---
