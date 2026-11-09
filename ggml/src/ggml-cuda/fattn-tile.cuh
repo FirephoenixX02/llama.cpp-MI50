@@ -1715,8 +1715,20 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+    // gfx906 A/B (2026-11-09, Pro VII, 9B + 0.8B, pp4096/pp512, 2x interleaved per-op with graphs):
+    // tile GQA ungrouping trades K/V tile re-reads for work-group count. The re-reads are free while
+    // the per-call KV window fits the 8 MiB L2 (pp512 fill: FA 2.57 -> 2.25 ms/call, -12.5%), and
+    // cost +6% once the KV window crosses L2 (pp4096: FA 2.64 vs 2.48 ms/call on both models).
+    // Landed default keeps always-grouped. GGML_CUDA_FATTN_TILE_GQA=0 enables the ungrouped-up-to-
+    // 16-token variant (ncols2 = 1 beyond the grouped cascade) for shallow-depth experiments.
     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
-    const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+    static const bool gcn_ungroup_prefill = GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+        getenv("GGML_CUDA_FATTN_TILE_GQA") != nullptr;
+    // Ungrouped tile sites (ncols2 = 1) only exist for DV <= 256 with DKQ not in {192, 320}:
+    // 576/320/512-DV512 have no ncols2 fallback, those stay grouped regardless.
+    const bool gcn_ungroup_ok = DV <= 256 && DKQ != 320 && DKQ != 192;
+    const int gqa_limit = (gcn_ungroup_prefill && gcn_ungroup_ok) ? 16
+                        : (nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX);
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DKQ == 320) {
