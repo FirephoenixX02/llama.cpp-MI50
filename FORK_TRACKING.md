@@ -14,7 +14,7 @@
 | **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
 | **Base date** | 2026-11-08 |
 | **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten) |
+| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment: ungrouped wins at shallow KV (-12.5% FA at pp512), loses +6% once the KV window crosses L2 (pp4096), default reverted to always-grouped, env keeps the variant, see "Tile GQA-Limit Experiment"; attention audit refreshed; all uncommitted), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
 | **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
 | **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -151,7 +151,7 @@ Key pillars:
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`51d1cf038`, `4e78727bc`) credit the furnace source commit in the body.
 >
-> Filter applied (donor `furnace/gfx906-perf` at `fc353a5ac`, range `905021dba..7bac8169e`): A: multigpu excluded (none new in range). B: non-opt excluded (`300fdfe3b` server `/props` config, `746887a5c` tests-only bench shapes, `47f6e5b8a` server `_exit`). C: GDN/qwen4exp arch excluded (`058d97848` GDN gather elision fix, `50798f69b` GDN gate/softplus/beta fusion, `a2207dd89` GDN q/k norm pairs, `3a30ac2c2` recurrent conv-step fusion - local has no GDN fusion base). D: only `sixvolts` + `Claude` commits ported. Earlier filter (donor at `905021dba`): multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split), README/tests-only/server/MTP/`llama` scheduler staging, `QSA`/sparse/`hc`/`dsv4` arch, `cohere2` handler, build switches, `solve_tri` scope, bounce fix; redundant skipped (`b3c18e502`, `2ffa92b3c`). Prior repack-tiling deferrals resolved via manual LEVER-adapted ports. qwen4exp arch still deferred per request.
+> Filter applied (donor `furnace/gfx906-perf` at `fc353a5ac`, range `905021dba..7bac8169e`): A: multigpu excluded (none new in range). B: non-opt excluded (`300fdfe3b` server `/props` config, `746887a5c` tests-only bench shapes, `47f6e5b8a` server `_exit`). C: GDN/qwen4exp arch excluded (`058d97848` GDN gather elision fix, `50798f69b` GDN gate/softplus/beta fusion, `a2207dd89` GDN q/k norm pairs, `3a30ac2c2` recurrent conv-step fusion; 2026-11-08 update: the "no GDN fusion base" reason is wrong at base `a691b2345` - the fused `GATED_DELTA_NET` op is default-on there and profiles at 3.3-4.4% GPU time on qwen35, see "GDN and attention shares" below; these micro-fusions remain excluded on share grounds, not on base grounds). D: only `sixvolts` + `Claude` commits ported. Earlier filter (donor at `905021dba`): multigpu (`TurboPrefill`, `NO_PEER_COPY`, layer-split), README/tests-only/server/MTP/`llama` scheduler staging, `QSA`/sparse/`hc`/`dsv4` arch, `cohere2` handler, build switches, `solve_tri` scope, bounce fix; redundant skipped (`b3c18e502`, `2ffa92b3c`). Prior repack-tiling deferrals resolved via manual LEVER-adapted ports. qwen4exp arch still deferred per request.
 
 ---
 
@@ -182,12 +182,12 @@ lines, i32 strides + plain mul-modulo).
 | `ggml/src/ggml-cuda/rope.cu` | +90/-39 | `GCN` `__sincosf`+`__logf` in `rope_yarn`; round-2 `RMS_NORM_MUL_ROPE` M-RoPE fusion (`963dc1514` port, `ed4f655a6`); kernel SGPR slim - i32 strides + plain mul-modulo (`ffc7e39c1`), tg128 +0.9% on 0.8B BF16, validated 2026-11-06 |
 | `ggml/src/ggml-cuda/vecdotq.cuh` | +59 | `GCN` `memcpy` `b1/b2_fast`, `v_perm` `MXFP4` `8-entry`, `GGML_GCN_VEC_DOT_MXFP4` `Q8_0` fast. |
 | `ggml/src/ggml-cuda/mmq.cuh` | +19/-2 | Vega `MMQ` `GCN`/`__gfx906__` dispatch; `J_max` fallback padding (`2b620d7b9`). |
-| `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | +17/-1 | Clamps `FATTN` `nstages=1` `occupancy=1` for `GCN` `64KB LDS`. |
+| `ggml/src/ggml-cuda/fattn-mma-f16.cuh` | dropped 2026-11-08 | The `GCN` MMA clamp (+17/-1, commit 19) removed: no MMA dispatch site was ever reachable on gfx906 at any fork base (see FATTN Decode Attention); provenance was a defensive import of vLLM-gfx906 Triton tuning, never an upstream or measured llama.cpp behavior. File is byte-identical to `origin/master` now |
 | `ggml/src/ggml-cuda/fattn-common.cuh` | +93 | `GGML_USE_HIP` `FATTN` auto native decision (`GGML_CUDA_FATTN_PATH`) + per-device `free_mem` probe (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/fattn-tile.cuh` | +330/-2 | GCN native `q8_0` `half2/float` loaders, SW-pipelined `KQ` prefetch, 16-wide narrow tile + occupancy-tuned 256 config (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/fattn-vec.cuh` | +6/-1 | Mask stride `nb31/2` fix for sequence-split `ne11` slice vs full mask rows (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/fattn.cu` | +63 | GCN native `q8_0`/`f16+q8_0` predicates + alloc skip + `VEC` vs `TILE` routing for quantized KV (`2b620d7b9`). |
-| `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64×64`. |
+| `ggml/src/ggml-cuda/solve_tri.cu` | +62/-47 | `MAX_K_FAST` 64 + `GCN` cap `64x64`. Cold path since base `a691b2345` - the fused `GATED_DELTA_NET` op covers qwen35 prefill and decode (`delta-net-base.cpp` fused defaults + `llama-context.cpp:348-350`) |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | +9/-1 | Bound `ssm_conv_long_token_f32` OOB fix. |
 | `ggml/src/ggml-cuda/concat.cu` | +78 | Tiled `dim-0` transpose path from furnace `19822e03a` (sixvolts + Claude Opus 5.5). |
 | `ggml/src/ggml-cuda/getrows.cu` | +49 | Short-row packing from furnace `596c95b54` (sixvolts + Claude Opus 5.5). |
@@ -213,7 +213,7 @@ rounds 1-2, bf16 repack, ISA notes).
 
 | # | SHA | Change | Result |
 |---|-----|--------|--------|
-| 1 | `0beb3a854` | solve_tri `MAX_K_FAST=64` + GCN cap 64x64 (Qwen3-Next delta-net prefill needs k=64) | fixes delta-net prefill |
+| 1 | `0beb3a854` | solve_tri `MAX_K_FAST=64` + GCN cap 64x64 (Qwen3-Next delta-net prefill needs k=64) | fixes delta-net prefill (cold path since base `a691b2345`: qwen35 prefill takes the fused GDN op; solve_tri reached only if fused ops are disabled) |
 | 2 | `562a6764a` | DPP warp reductions (`quad_perm`/`row_ror`/`ds_swizzle`, float/float2/int) instead of shfl -> `ds_bpermute` LDS roundtrips | gemma4 31B tg128 +4.7% |
 | 3 | `d7fe6c82c` | GCN Q4_K repack buffer type: 3-plane host repack, pow2 `MATRIX_ROW_PADDING` HBM fix, 2D f32 MUL_MAT only | matvec ~58% -> ~89% HBM BW |
 | 4 | `00cca237f` | Repacked int8 MMQ tile GEMM (64x64, BK=4, 4x4 micro-tile, LDS-staged sub-blocks), `GGML_CUDA_REPACK_NO_MMQ` fallback | gemma4 pp512 +14.2%, tg128 22.29 -> 26.57 |
@@ -231,7 +231,7 @@ rounds 1-2, bf16 repack, ISA notes).
 | 16 | `e95f70b60` | Bound `ssm_conv_long_token_f32` staging read (upstream bug #20128) | spec-decode memfault fix |
 | 17 | `a06580527` | Build script repack defaults (dropped in `961362c5c`: runtime env took over) | - |
 | 18 | `8ed3854ef` | Vega20 MMQ config: new `mmq-config-vega.cuh`, occupancy 1, `I=128`, `launch_bounds(256,1)` | MMQ works on 64KB LDS |
-| 19 | `b143fd169` | FATTN MMA clamp nstages=1 / occupancy=1 for GCN (64KB LDS W64 dp4a) | kills FATTN spill |
+| 19 | `b143fd169` | FATTN MMA clamp nstages=1 / occupancy=1 for GCN (64KB LDS W64 dp4a) | killed (never-launched) mma-kernel spills; dropped 2026-11-08, see FATTN Decode Attention |
 | 20 | `0b8b50219` | Q2_0 MMQ config rows (fixes `J_best=0` abort), `Global` graph capture, substring `matches_filter` | MUL_MAT 1288/1288 OK |
 | 21 | `2b620d7b9` | Milpster port batch: native q8_0 FATTN tile + SW prefetch, FATTN mask `s31` fix, HIP graph kernel-func guard, MMQ `Q6_K I=64 occ2` + `J_max`/NVFP4 padding | see FATTN section below |
 
@@ -339,7 +339,7 @@ Validation (1x MI50 gfx906, ROCm 7.2.4, `build-llamacpp-rocm.sh` clean):
 ## Correctness Notes
 
 - All repacked matvec/MMQ variants validated via `wikitext PPL` vs GEMM/canonical within noise (tokens in commit logs).
-- `ub=1 PPL` checks: Q5_K/Q6_K, Q8_0 (5.07 vs 5.12), MoE ID paths, FATTN clamp (no PPL regression cited; LDS correctness).
+- `ub=1 PPL` checks: Q5_K/Q6_K, Q8_0 (5.07 vs 5.12), MoE ID paths, FATTN clamp (no PPL regression cited; LDS correctness - clamp kernels are unreachable on gfx906 at base `a691b2345`, see FATTN Decode Attention).
 - `n_tokens/ne11==1` paths collapse to original launch -> single-stream byte-unchanged for concurrent-decode batching commits.
 - Env gates for debugging without rebuild: `GGML_CUDA_REPACK`, `GGML_CUDA_REPACK_Q8_0`, `GGML_CUDA_REPACK_MOE`, `GGML_CUDA_REPACK_NO_MMQ`, `REPACK_TRACE`, `REPACK_NOFOLD`, `GFXPROF`, `GGML_CUDA_FATTN_PATH` (`auto`/`force_convert`/`force_native` for `2b620d7b9` native `q8_0` tile).
 - `test-backend-ops` on `gfx906` (`HIP` `ROCm 7.2.4`): after `Vega Q2_0` fix, `MUL_MAT` `1288/1288 OK` (`ROCm0`), `q2_0` `47/47`, `q4_K` `64/64`, `q5_K` `29/29`, `q6_K` `13/13`, `RMS_NORM` `51/51 OK` (fused + vectorized). Prior `J_best=0` abort blocked repack `Q4_K/Q5_K/Q6_K` coverage. `2b620d7b9` adds `mask s31` fix, `graph kernel guard` (MUL_MAT_ID quantize swap), `MMQ` `J_max`/`NVFP4` padding — no PPL delta, graph stable on spec-decode fan-out.
@@ -368,6 +368,7 @@ Validation (1x MI50 gfx906, ROCm 7.2.4, `build-llamacpp-rocm.sh` clean):
 | `REPACK_NOFOLD=1` | unset | Disable `ssm_out` `ne12` fold |
 | `GFXPROF=1` | unset | HIP-events per-op profiler |
 | `GGML_CUDA_FATTN_PATH=auto\|force_convert\|force_native` | `auto` | FATTN quantized-KV path selector (`2b620d7b9`): `auto` probes free mem vs `f16` shadow (20% headroom) per device, `force_*` overrides for bench. |
+| `GGML_CUDA_FATTN_TILE_GQA=1` | unset (always-grouped, pre-experiment behavior) | 2026-11-09 experiment, see the Tile GQA-Limit section: any set value enables the `gqa_limit = 16` shape (grouped up to 16 query tokens, ungrouped `ncols2 = 1` beyond, only where an ungrouped site exists: DV <= 256, DKQ not 192/320). Wins -12.5% FA while the KV window fits L2, loses +6% once it crosses; default stays grouped. |
 | `GGML_CUDA_REPACK_Q4_0=1` / `GGML_CUDA_REPACK_IQ=1` | ON (0 opts out) | Q4_0 / IQ4_NL / IQ4_XS / IQ3_S repack, 2D weights only (`7f70fff53` port) |
 | `GGML_CUDA_Q3K_RELABEL=1` | ON (0 keeps 3-bit kernels) | Q3_K stored/computed as Q6_K planes (exact) |
 | `GGML_CUDA_NO_MMQ_NARROW=1` | unset | Restore 64-wide MMQ token tile for <=48 columns |
@@ -402,11 +403,12 @@ Build via: `./build-llamacpp-rocm.sh` (requires `/opt/rocm-7.2.4`).
 | `MUL_MAT` `J_max`/`NVFP4` padding | Upstream bug (stream-k tail overread). Upstream reworked the padding (`src1_q8_1_padding` + `J_best`) and kept the `NVFP4` `y_scale` `+128` guard, so the fork hunk was dropped in the 2026-10-19 rebase | Nothing left to port - re-check at the next rebase |
 | `HIP` graph `hipGraphExecUpdate` kernel guard | HIP bug (launch-bounds not validated on func change) | Keep; consider upstreaming `common.cuh:1411` + `ggml-cuda.cu:2676` |
 | Repack buffer type | Fork-only; invasive (~2.5k LOC). Upstreaming would need feature-flag review | Keep fork-local, rebase-friendly, avoid touching hot paths when gated off |
-| FATTN GCN clamp | Fork-only; correctness on 64KB LDS | Validate against upstream FATTN changes at each rebase |
+| FATTN GCN clamp | Fork-only; dropped 2026-11-08 (was dead code on every fork base, see FATTN Decode Attention) | Done - file matches `origin/master`; nothing left to port or validate |
 | FATTN GCN native `q8_0` tile | Fork-only; GCN 64KB LDS compact vs `f16` shadow | Keep; `GGML_USE_HIP` gated, validated via `ggml_cuda_fattn_use_native_tile` probe |
 | Vega20 MMQ table | Derived from RDNA2 occupancy 1; `Q6_K I=64 occ2` after `2b620d7b9` (`+4.2%` PP) | Keep; upstream MMQ tables live in `mmq.cuh` and change often - rebase conflict expected |
 | DPP warp reductions | GCN-only `#ifdef`; no CDNA/RDNA impact | Keep; re-check if upstream refactors `common.cuh` reductions |
 | `MoE` weighted-reduction empty-tail | Fixed here `5a2255fcc` (node-walk bounds + zero-token alloc deps, ported from mx-llama.cpp `ef7246cd9`) | Check if upstream still walks past `n_nodes` on empty last-layer chains; PR if missing - see `ggml-cuda.cu:3968` |
+| FATTN quantized-KV decode at batch=1 | On GCN (and by the same dispatch shape on CUDA), nc=1 with quantized K/V always runs `fattn-vec` with `cols_per_block=1`: the per-(q-head, chunk) kernel re-does V dequant + P.V FMA per q head. Loads are L2-absorbed; the VALU work is not. Measured 2026-11-08, see "FATTN Decode Attention" below | Both grouped routes falsified 2026-11-08 (head-grouped VEC 2-3x worse; grouped native tile 1409/2288/2852). The gap is wave-count-bound, not op-count-bound; leave it, or revisit with a new kernel geometry |
 
 ---
 
@@ -648,7 +650,126 @@ Validation (2026-11-06, 1x MI50 gfx906, ROCm 7.2.4, build `2aa788490` + WIP):
   `llama-batched-bench` OOMs unless `-c` is pinned (default context allocates ~36 GB at N_KV for
   8 sequences), and `GFXPROF=1` aborts in `llama-cli` (pre-existing tooling issue, untouched).
 
+## GDN and attention shares (2026-11-08, same Pro VII pass, qwen35 + one dense model)
+
+Method note: the GDN op was invisible to `GFXPROF=1` tables because the fused-node walker
+(`ggml-cuda.cu` gated_delta_net + state-cpy fused into one launch) evaluates outside the per-node
+loop the profiler hooks. A temporary event-timed hook around `ggml_cuda_op_gated_delta_net_fused_cache`
+(measured, then reverted) closed the blind spot. Fused-op defaults confirmed at
+`llama-context.cpp:348-350` (`fused_gdn_ar/ch = true`), in-graph via a 3-line trace (measured,
+reverted): prefill nt=512 and decode nt=1 both take `build_delta_net_fused`.
+
+Share table (serialized GPU ms, nograph; GDN op includes its fused state-cpy):
+
+| op | qwen35 pp4096 | qwen35 decode d4K | qwen35 decode d8K |
+|---|---:|---:|---:|
+| GATED_DELTA_NET+cpy (fused) | 188.7 ms = 4.4% | 418 us/tok = 3.6% | 358 us/tok = 3.3% |
+| FLASH_ATTN_EXT (8 full-attn layers) | 195.8 ms = 4.6% | 556 us/tok = 4.8% | 688 us/tok = 6.4% |
+| dense-model FLASH_ATTN_EXT (`Spark-X2.6-4B` pp4096) | 509.3 ms = 23.8% | - | - |
+| rest (repaked matvecs, MoE, glue) | ~91% | ~91.6% | ~90% |
+
+Consequences:
+
+- GDN recurrence tuning is a dead end on this base: the upstream fused op plus the fused-cache
+  path already run the recurrence at 3.3-4.4% of GPU time on the GDN-hybrid flagships. A 2x
+  better GDN kernel would move the wall by ~2%. GDN decode is depth-invariant (linear attention),
+  as expected. `solve_tri` is cold: only the non-fused chunking branch uses it, which nothing
+  takes at these defaults.
+- Attention-side work is dense-model-weighted: the tile prefill inefficiency (5.8% of `v_dot2`
+  peak, FATTN section above) costs ~24% of pp GPU time on dense models but only ~4.6% on the
+  GDN-hybrid; quantized-KV decode GQA grouping matters 21-25% on dense models (FATTN Decode
+  Attention) vs <7% on the hybrid. Both candidates pay only where full-attention layers
+  dominate, i.e. for dense-architecture targets.
+
 ---
+
+## HIP Fast Math + F32 GEMM ldc Fix (2026-11-09, applied and validated)
+
+### HIP fast math: off -> on
+
+Upstream history: `-ffast-math` HIP (#23862) + `-fno-finite-math-only` (#25373), disabled (#25495); then `-funsafe-math-optimizations` (#24668), removed in #26696 because its implied `-fassociative-math` reorders FP reductions and flipped greedy argmax on RDNA3.5. Base `a691b2345` ships HIP fast math off (the CUDA branch of `ggml/src/ggml-cuda/CMakeLists.txt` keeps its own `-use_fast_math`).
+
+Applied to `ggml/src/ggml-hip/CMakeLists.txt` (same hunk as the recent PR, comment included):
+
+```
+-funsafe-math-optimizations -fno-associative-math -fno-math-errno -fno-rounding-math -fgpu-flush-denormals-to-zero -fsigned-zeros -fgpu-approx-transcendentals
+```
+
+Verified offline with the ROCm 7.2.4 clang 22 cross-compile for gfx906 (no GPU execution):
+
+| Check | Result |
+|---|---|
+| expf lowering | ~20-inst OCML polynomial + clamps -> 2 insts: `v_mul_f32` (x*log2e) + `v_exp_f32` |
+| tanhf / silu / rsqrtf / 1/x | brev/bfi 2-inst form / bare `v_rsq_f32` / `v_rcp_f32` (was `v_div_scale` Newton chain) |
+| mixed test kernel body | 121 -> 77 instrs (`-funsafe-math` alone: 94; the 94->77 step is `-fgpu-flush-denormals-to-zero`) |
+| `-fgpu-approx-transcendentals` alone | inert (implied by `-funsafe-math-optimizations`, kept for symmetry with the PR) |
+| IR `reassoc` | `unsafe` alone: 2 -> with `-fno-associative-math`: 0 (the #26696 regression class is off) |
+| IR `nsz` | `unsafe` alone: 2 -> with `-fsigned-zeros`: 0 |
+| FMA contraction | still fast (8/8 `v_fma` in a serial MAD loop preserved) |
+| finite-math | stays off (`-ffinite-math-only` not enabled) -> INFINITY masking in SOFT_MAX/FATTN safe |
+| FP mode metadata | `float_denorm_mode_32` 3 -> 0 (FTZ f32 only), `round_mode` stays RN, f16/f64 denorm mode unchanged |
+
+Ops affected: silu/GLU MoE gate (expf), SOFT_MAX + FATTN softmax (expf per KQ element), logit-softcap tanhf, rms-style rsqrtf (`norm.cu` already called it explicitly). dp4a/integer repack+MMQ paths and hipblas are untouched. `ggml-hip` rebuilt clean with the flags on 2026-11-09 (fattn-tile q8 spill counts unchanged, see audit below).
+
+Runtime validation (this host, Radeon Pro VII 16 GB, ROCm 7.2.4, r=3, same host+session A/B vs a second build dir `build-nofm` with the flag set removed; keep that dir around until the round is closed):
+
+- `test-backend-ops -b ROCm0 -o SOFT_MAX -o UNARY -o FLASH_ATTN_EXT -o RMS_NORM -o RMS_NORM_MUL_ROPE`: 288/288 OK.
+- `Qwen3.5-9B UD-Q4_K_XL`: no-fast-math pp512 `1016.25 +/- 9.47` / tg128 `84.26 +/- 0.02` vs fast-math pp512 `1013.23 +/- 11.16` / tg128 `84.31 +/- 0.01` - neutral (the pre-fast-math recorded refs of 987.92/83.06 are from the MI50 box, cross-machine; on this host the delta is noise).
+- `Qwen3.5-0.8B BF16`: pp512 `6566.97 +/- 575.47` / tg128 `199.00 +/- 0.56` vs `6565.81 +/- 592.93` / `198.89 +/- 0.35` - identical within noise.
+- PPL (9B, wikitext, c 1024, 2 chunks): fast-math `6.2945` vs recorded repack-on `6.3304` / repack-off `6.3036` (different host + approx-transcendental kernels; within the +/- 0.49 error bar, no regression signal).
+
+Interpretation: flags behave exactly as the PR claims on gfx906, numerics gate passes, but both bench models under-represent the affected kernels (repacked MMQ/hipblas prefill, small expf share) so end-to-end is neutral. Kept for CUDA parity and for the expf/silu-heavy paths the bench models do not cover (Ling-type MoE GLU decode, softcap models, FATTN q8 tile softmax). Worth a GFXPROF per-op A/B on a GLU-heavy MoE model before judging it done.
+
+### GCN GEMM ldc fix for chunked dst (build-validated 2026-11-09; PPL check pending)
+
+Fork-latent bug, env-gated (`GGML_CUDA_GCN_F32_GEMM=1` + `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` + F16/BF16 weights whose F32 copy exceeds 512 MiB). Upstream `#29442` (`ab09ea4c1`, 2026-10-06) added F16/BF16 -> F32 conversion chunking that calls `ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>` with a dst view (data offset one chunk, `ne[0]` = chunk rows, `nb[1]` = full row stride kept). The fork's own GCN GEMM (`41dee49df`, 2026-09-23, predates the chunking) passed `(int) ne0` as the output-stride arg to `gcn_f32_gemm_skinny` / `gcn_f32_gemm_tn_rb`: on the first chunk that equals the true stride, on later chunks every output column past the first row-block is written at the chunk stride instead of the full stride — same bug class as mx-llama.cpp `2f5cf9337` (their `chunk_src0` branch and the outer-chunk loop do not exist in this base; the fix does not map 1:1).
+
+Fix applied in `ggml-cuda.cu`: skinny and tn_rb call sites pass `(int) ldc` (`ldc = nb1/sizeof(float)`, equals `ne0` for full tensors so unchanged there); split-K part slices stay contiguous with `ne0` (kernel calls unchanged) and `gcn_f32_splitk_reduce` gained `ne0`/`ldc` params and scatters `y[(i % ne0) + (i / ne0) * ldc]`, an identity when `ldc == ne0`. The mx commit (`2f5cf9337`) itself needs no port. Still to run: PPL on a BF16 model with a >512 MiB F32 copy and `GGML_CUDA_GCN_F32_GEMM=1` (e.g. 0.8B BF16, 1.5 GiB F32).
+
+### Attention candidate refresh (audit on the 2026-11-09 fast-math rebuild)
+
+Method: `amdgcn-audit.py` on the in-tree objects; cross-checked against the fattn-tile dispatch (`fattn-tile.cuh:1592` `cols_per_block = DKQ <= 128 ? 64 : 32`, `Q->ne[1] > 4` -> `flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2>`).
+
+| Item | Measured (fast-math rebuild, audit re-run 2026-11-09) | Candidate |
+|---|---|---|
+| `flash_attn_tile` dkq128/dv128 f16 | spill-free at V128, LDS 29696 (2 WG/CU) | ok, no action |
+| `flash_attn_tile` dkq128/dv128 quantized (k_q8_0 / v_q8_0 / v_q4_0) | spill 867-920 dwords at every ncols1 >= 8 geometry, unchanged by fast math: exactly the geometries the native q8 prefill/batch-decode tile dispatches for GQA r=8 (8x8) and r=4 (16x4) with cols_per_block 64; driver is `Q_k[2][cpw][cpy_ne]` + cpw=16 unroll | flag-aware config table: nthreads 512/occ1 for quantized instances at ncols >= 32 (halves cpw 16 -> 8 and the double-buffer register state); ~40-line diff, measurable via GFXPROF spill -> 0 |
+| `flash_attn_tile` dkq256/dv256 quantized | spill 120-130 (cols_per_block 32 -> smaller ncols); f16 spill-free | same fix, smaller payoff (Spark dense prefill) |
+| `flash_attn_tile` VKQ (P*V) phase | `__hmul2`+`__hadd2` with f16 accumulators: 1 inst per scalar madd, while the KQ phase already runs `v_dot2_f32_f16` asm (0.5 inst + f32 acc) via `ggml_cuda_mad` | transposed KQ'/V' LDS staging (k-adjacent pairs contiguous per jc and per v) would convert the VKQ loop to dot2: halves the P*V instruction count and lifts the f16 accumulator. LDS traffic equal (each element read once either way). NOT bit-identical (pairwise f32 accumulation order differs; f16 accumulator today), so needs the PPL chain. Bigger restructure, the 5.8%-of-`v_dot2`-peak item from the ISA notes; do config table first |
+| `flash_attn_mask_to_KV_max<32>/<64>` | SGPR spill 108/331 (decode helper) | low priority |
+| `rms_norm_mul_rope_f32` | S100 + SGPR spill 3-14 per instance (i32 slim from `ffc7e39c1` did not fully clear it, fast math does not move SGPR), occupancy 8; grid y/z clamped to 65535 so the channel/sample loops never fold away | port mx-llama.cpp `f6da2e696`: template the loop-carrying norm kernels, use a no-loop instance when the grid fits (norm family kernels in `norm.cu:17/124/332` share the pattern). Target S <= 80 (10 waves) + spill 0. Runs per decode token on M-RoPE models |
+
+Falsified routes from 2026-11-08 remain falsified (quantized-KV decode GQA grouping, native tile at nc=1); the decode attention gap stays open per FORK_TRACKING.
+
+## Tile GQA-Limit Experiment (2026-11-09, `GGML_CUDA_FATTN_TILE_GQA`, default reverted to grouped)
+
+Hypothesis: upstream skips the fattn-tile GQA grouping when `Q->ne[1] > 16` on NVIDIA because "the GQA optimizations seem detrimental in some cases"; gfx906 always groups (`gqa_limit = INT_MAX`), so prefill tiles always launch grouped (`ncols2 = gqa_ratio`). The tile-GQA grouping fixes `cols_per_block` (64 for DKQ <= 128) as the total ncols regardless of ncols2, so grouping only trades K/V tile re-reads (L2-absorbed) against work-group count.
+
+Experiment: first as an env toggle (`GGML_CUDA_FATTN_TILE_GQA=0` -> ungrouped everywhere), then folded into the dispatch. Protocol: `GGML_CUDA_DISABLE_GRAPHS=1 GFXPROF=1 llama-bench`, FA `tot_ms` on 16 pp512 FA calls, 2x interleaved runs per variant (the 2026-11-08 measurement-hygiene rule); 9B (dkq128, GQA r8, f16 KV), Pro VII.
+
+| Phase | grouped (old default) | ungrouped | Delta |
+|---|---:|---:|---|
+| pp512 fill FA tot | 40.8-41.1 ms | 35.7-36.8 ms | **ungrouped -12.5%** (4/4 interleaved runs consistent) |
+| end-to-end pp512 (graphs) | 999.5 +/- noise | 991.7-1009 | ~+0.5% (FA is 3.9% of the pp wall on this hybrid model) |
+| decode FA d0..129 | n/a (identical dispatch) | n/a | no dispatch change: the `K->ne[1] % FATTN_KQ_STRIDE` condition blocks grouping for depths 1..255 in both the old and new defaults; the 3 interleaved pairs showing G < U (239.5-245.4 vs 252.9-260.8 ms) are session drift, not dispatch |
+| 0.8B BF16 pp512 FA | 27.6-33.6 | 29.0-35.0 | unresolvable in noise (drift +/-25% swamps the ~0.3 ms/call delta at this size) |
+| PPL (9B, c 1024, 2 chunks) | 6.3304 / 6.3036 refs | 6.3005 | within band, no quality shift |
+
+pp4096 A/B (with graphs, GFXPROF per-op FA, 2x interleaved pairs per model; pp4096 also tightened the e2e sigma to +/-0.3-0.5%):
+
+| Phase | grouped (old default) | ungrouped (beyond 16 tokens) | Verdict |
+|---|---:|---:|---|
+| pp4096 FA per-op, 9B (96 calls) | 317.5/318.7 ms, 2.480-2.490 ms/call | 338.2/340.0 ms, 2.642-2.656 ms/call | **ungrouped +6%** (2/2 tight pairs) |
+| pp4096 FA per-op, 0.8B (96 calls) | 135.6/136.8 ms, 1.412-1.425 ms/call | 144.1/144.5 ms, 1.501-1.505 ms/call | **ungrouped +6%** (2/2 tight pairs) |
+| pp4096 e2e, 9B | 991.3 +/- 0.3% mean | 989.3 +/- 0.3% | grouped +0.2% (2/3 pairs ordered, borderline) |
+| pp4096 e2e, 0.8B | 6430 +/- 0.4% mean | 6374.6 +/- 0.6% | grouped +0.9% (2/3 pairs ordered) |
+| pp512 fill FA (nograph) | 40.8-41.1 ms | 35.7-36.8 ms | ungrouped -12.5% (4/4; the first round's win) |
+
+Depth explains the flip: each FA call's KV working set grows with depth; at pp512 (<=1 MB per call) the 8x K/V re-reads of the ungrouped geometry stay inside the 8 MiB L2 and the extra work-groups win (-12.5%); once the KV window crosses L2 (8.4 MB at pp4096) the re-reads pay HBM (+6%). Deep prompts are the common case, so the net is negative.
+
+Landed decision (revert): the gfx906 dispatch is back to always-grouped (pre-experiment behavior). `GGML_CUDA_FATTN_TILE_GQA` (any set value) re-enables the `gqa_limit = 16` shape (grouped up to 16 query tokens, ungrouped `ncols2 = 1` beyond), valid only for `DV <= 256 && DKQ != 192 && DKQ != 320` (`576/320/512-DV512`/192/320 have no ungrouped site - the first landing GGML_ABORT'ed there, caught by `test-backend-ops -o FLASH_ATTN_EXT`). Validation after the revert: 9B pp4096 per-op FA 318.5 ms / 2.4887 ms/call = the grouped number; FLASH_ATTN_EXT suite all OK; `build-llamacpp-rocm.sh` clean.
+
+Follow-up idea if ever revisited: a depth-conditional gqa_limit (ungrouped only while `K->ne[1] * DKQ * 4B * gqa_ratio` fits L2) would recover the shallow-fill win without the deep-prompt cost, for <1% pp in exchange for a dynamic dispatch rule - not taken under the simplicity bias. A dense-model (Spark dkq256) check is likewise pending with the reverted default.
 
 ## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
 
@@ -665,6 +786,126 @@ branch `master`), ported with `Original author: milp` credit. Excluded: multi-GP
 | `ec5e7a7a7` | `2da432a72` | Skip recurrent pos scan when batch pos is given (`llama-batch.cpp`) | landed |
 | `137d79114` | `2da432a72` | Native q8_0-K / q4_0-V FATTN tile (engages with quantized KV only; wins are memory - no f16 shadow for q4_0 V) | landed |
 | `bc87c64d0` | - | Fix GCN `supports_op` gate that forced FILL/TRI/DIAG onto CPU (KDA/delta-net PPL blowup on Ling-3.0-tiny: b1 c32 29.6 -> 1838.7; fix restores 28.03) | fork-original fix |
+
+---
+
+## FATTN Decode Attention: quantized-KV GQA gap measured (2026-11-08, no code landed)
+
+Problem: at single-token decode (`Q->ne[1] == 1`) on GCN with quantized K/V, `fattn.cu` always
+returns `BEST_FATTN_KERNEL_VEC`: the three native-tile predicates (`fattn.cu:556/572/588`) require
+`Q->ne[1] > 2`, and the GCN guard at `fattn.cu:732` falls through to VEC below that. VEC then runs
+with `cols_per_block = 1` (`fattn-vec.cuh:560-569`), i.e. one block per (q-head, KV chunk), mapping
+`K += nb12*(head / gqa_ratio)` (`fattn-vec.cuh:112-113`): per q-head K/V loads, and per q-head
+re-executed V dequant + P.V FMA. f16/f32 KV with `gqa_opt_applies` already routes to the TILE kernel
+with `ncols2 = gqa_ratio_eff` (heads grouped per KV head), so only quantized-KV decode pays the
+linear-in-heads loop. Same dispatch shape exists on CUDA (`fattn.cu` Turing/MMA branch returns VEC at
+`Q->ne[1] == 1` for quantized KV): not GCN-specific.
+
+Measurement (Radeon Pro VII 16 GB, ROCm 7.2.4, build `f518082a3`, `GGML_CUDA_DISABLE_GRAPHS=1`
+(see side finding below), `GFXPROF=1` per-op HIP events): model `Spark-X2.6-4B-Q8_0` (36 layers,
+16 heads, 4 KV heads, GQA r=4, head_dim 256, dense attention), `llama-bench -fa on -p 0 -d <L>
+-n {1,129} -r 1 --no-warmup`, decode attention per token = `(FLASH_ATTN_EXT tot_ms at n=129 -
+tot_ms at n=1) / 128` (depth fill cancels out; call counts in the GFXPROF rows confirm the
+ubatch bookkeeping).
+
+| KV | kernel at nc=1 | depth 512 | 4K | 8K |
+|---|---|---:|---:|---:|
+| f16 | TILE, grouped (ncols2=4) | 966 | 1373 | 1609 |
+| q8_0 | VEC, cols=1 (current dispatch) | 1504 | 2138 | 2669 |
+| q8_0 | native TILE at ncols1=1 (4-line patch + `GGML_CUDA_FATTN_PATH=force_native`) | 1409 | 2288 | 2852 |
+
+(all values `us/token` over 36 layers)
+
+Findings:
+
+- Loads are not the cost: the x4 K/V re-read is mostly L2-absorbed (641 MB HBM per step once-read,
+  ~241 GB/s effective). The kernel is VALU bound: V dequant + P.V FMA run once per q head (x4
+  here); the duplicated K-side dp4a is cheap.
+- Depth scaling confirms compute/latency bound, not bandwidth: x16 depth grows time only 1.77x;
+  steady-state segment ~258 GB/s once-read equivalent, vs 751 GB/s the f16 TILE sustains at the
+  same nc1=1 x ncols2=4 geometry - the hardware headroom is real.
+- Rerouting decode to the existing native q8_0 tile is falsified: a 4-line patch (relax
+  `Q->ne[1] > 2` to `>= 1` in `fattn.cu:556/572/588` and the `fattn-tile.cuh:1598` native-cascade
+  gate, A/B via `GGML_CUDA_FATTN_PATH`, validated with `test-backend-ops -o FLASH_ATTN_EXT` first)
+  measured 1409/2288/2852 - the tile's int8/V LDS staging does not amortize at ncols1=1. Patch
+  measured and reverted; tree and build match `f518082a3`.
+- Grouping inside the VEC kernel itself is falsified as well (2026-11-08, same protocol, env-gated
+  WIP on `f518082a3`, reverted after measurement): template `flash_attn_ext_vec` with
+  `head_grouped` - one block covers all `gqa_ratio` q heads of one KV head, KQ dot lanes 4 -> 8 to
+  halve the per-head q8 VGPR (D=256/hg=4 247 VGPR, D=128/hg=8 255 VGPR, both spill-free per
+  `amdgcn-audit.py`; hg 8 gated to D <= 128, D=256/hg=8 = 256 VGPR + 32 spill). hg must equal
+  `gqa_ratio`. `launch_fattn<D, 1, hg>` and `flash_attn_combine_results` reused unchanged. Dispatch
+  gate `GGML_CUDA_FATTN_GQA_VEC=1`, GCN-only. Correctness: `test-backend-ops -o FLASH_ATTN_EXT`
+  4304/4304 with the env set. Measured decode attention per token (FLASH tot n129 - n1, r=1
+  no-warmup, `force_native`, Spark 4B q8_0 KV, interleaved OFF/ON per depth): stock
+  1484/2144/2797 us at d512/4K/8K (matches the 1504/2138/2669 recorded above) vs grouped hg=4
+  4794/4909/5475 - 2.0-3.2x WORSE at every depth. End-to-end tg128 d8K: 88.59 stock vs 70.42
+  grouped. Reverted; tree and build match `f518082a3`.
+- Why grouping loses (corrected bottleneck model): decode attention concurrency is bounded by work
+  units = KV heads x KV chunks (4 x ~4 = 16 units at d512). Stock VEC manufactures 4x more units
+  (q heads x chunks) out of the redundant per-head K/V reads - reads that are mostly L2 absorbed,
+  i.e. nearly free parallelism. Grouping amortizes the V dequant but cannot create units: at d512
+  the grouped grid holds 16 blocks x 2 warps = 32 wave64s on 60 CUs (over half the machine idle)
+  while each wave does up to 4x the work. Deep KV raises parallel_blocks (~30 at 8K fills the
+  machine), but the 247 VGPR 4-head Q state cuts occupancy to 4 waves/CU (vs 7 at 129 VGPR) and
+  the per-wave ILP still carries the x4 work - still ~2x. The ceiling priced the fix at the f16
+  tile's 751 GB/s streaming rate; the q8_0 decode path is compute/latency bound, not bandwidth
+  bound, so amortizing reads cannot pay for the lost wave count.
+- Measurement hygiene: GFXPROF FA deltas from back-to-back r=1 runs drift with clock/cache state.
+  Always interleave OFF/ON per depth in one session; the first (sequential) pass of the grouped-VEC
+  A/B produced flat-off stock numbers that made the regression look like nothing - the interleaved
+  pass above reproduced the doc's stock rows exactly.
+- End-to-end cost of the gap (`llama-bench -n 128 -r 3`, nograph): q8_0 KV tg128 d4K `98.27 +/- 0.76`
+  / d8K `92.99 +/- 0.73` vs f16 KV `110.84 +/- 1.30` / `109.74 +/- 1.34`. Attention share of decode
+  wall: q8_0 21% (d4K) / 25% (d8K); f16 15% / 18%. Quantized KV currently costs 8-16% tg for the
+  VRAM it saves (~1 GB at 8K on this card).
+
+Candidate fix (built and falsified 2026-11-08): the head-grouped narrow decode variant inside
+`fattn-vec.cuh` - block = (KV chunk, all r q-heads of one KV head), K/V loads and V dequant once,
+per-head KQ dp4a + online max, reusing the VEC KV-split + `k_combine` merge and the GCN fast
+vecdotq, spill-free at 247-255 VGPR via 8-lane KQ dots - measured 2.0-3.2x WORSE than stock at
+every depth; see the grouped-VEC bullet above. Also not worth pursuing (checked):
+`parallel_blocks` tuning (does not remove the xgqa VALU work; and the unit count, not the split,
+is the binding constraint), `force_convert` at decode (re-copies KV to f16 per step, >=3x
+traffic), mixed K/V type tricks (no native tile path exists for them at nc=1), and sub-groups
+(hg < gqa_ratio would need a partial-group grid; the unit-count argument covers it). With
+grouping falsified in both the VEC and the TILE geometry, the quantized-KV decode gap on GCN is
+structural at this kernel generation: closing it needs a different kernel shape (per-wave work
+must not scale with gqa_ratio while unit count stays KV heads x chunks - a hard ask on wave64
+dp4a), otherwise accept the 8-16% tg cost for the VRAM quantized KV saves.
+
+Side findings:
+
+- `llama-bench` decode aborts under HIP graphs on this build: `operation not permitted when stream
+  is capturing` in the buffer pool alloc (`ggml-cuda.cu:565`), also reproducing on the documented
+  `-p 512 -n 128 -r 1` invocation without GFXPROF. Prefill completes; the abort hits the first
+  decode capture. Probably VRAM/allocator-timing dependent - the 2026-11-08 validation runs pass
+  on the 32 GB MI50 per the table above, this is the 16 GB Pro VII. Open item, unrelated to FATTN;
+  all numbers here are nograph.
+- `ggml_cuda_fattn_auto_native` keeps f16-convert while the f16 shadow fits (20% free-mem headroom),
+  so for small caches the native tile machinery is dormant by design; it only engages via
+  `GGML_CUDA_FATTN_PATH=force_native`, and then only where the `fattn.cu` predicates pass
+  (`Q->ne[1] > 2` today). Relevant whenever touching the tile dispatch.
+- fattn-mma is unreachable on gfx906 at base `a691b2345`: every `BEST_FATTN_KERNEL_MMA_F16`
+  return site is gated on Turing/Volta (NVIDIA), `amd_mfma_available` (CDNA only,
+  `common.cuh:359-361`) or `amd_wmma_available` (RDNA3/4, `common.cuh:367-368`). Per the
+  Vega 7nm ISA doc, gfx906 has no MFMA/matrix-core instructions at all: packed math only
+  (`V_PK_FMA_F16`, `V_DOT2_F32_F16`, `V_DOT4_I32_I8`, `V_DOT8_I32_I4`). What runs is fattn-tile,
+  which does emit real `v_dot2_f32_f16` (`V_DOT2_F32_F16_AVAILABLE`, `common.cuh:902-904`).
+- Fork commit 19 (`b143fd169`, 2026-09-10) clamped the fattn-mma config for GCN
+  (nstages=1, occupancy=1), justified in the body by vLLM-gfx906 Triton flash-attn tuning
+  ("2 stages doubles K+V LDS > 64KB, spills"). It never had a live window: at every fork base
+  (`ec91ab5ad`, `311d4211b`, `a691b2345`) the dispatch already excluded gfx906, upstream has no
+  analogous behavior (no GCN references in upstream `fattn-mma-f16.cuh`), and no fork commit ever
+  touched the MMA dispatch sites. No llama.cpp measurement ever backed the "kills FATTN spill"
+  effect. Dropped 2026-11-08: `fattn-mma-f16.cuh` is byte-identical to `origin/master` now,
+  build clean, `llama-bench` smoke pass.
+- fattn-tile efficiency on gfx906 (same GFXPROF data): prefill attention at the depth-512 fill,
+  f16 KV = 51.1 ms for 38.7 GMAC whole-model = 0.76 TMAC/s = 5.8% of the `v_dot2` peak
+  (13.1 TMAC/s at 1.82 GHz, same quarter-wave-rate accounting as the ~28 TMAC/s dp4a figure),
+  ~21% of the pp512 wall on `Spark-X2.6-4B-Q8_0`. A same-instruction-class tiled kernel holds
+  ~13% of peak - roughly 2.3x headroom. Open item: better tiled prefill attention geometry, or
+  leave if prefill share benchmarks smaller on the main bench models.
 
 ## Maintaining This Document
 
