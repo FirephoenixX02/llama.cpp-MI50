@@ -14,7 +14,7 @@
 | **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
 | **Base date** | 2026-11-08 |
 | **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment: ungrouped wins at shallow KV (-12.5% FA at pp512), loses +6% once the KV window crosses L2 (pp4096), default reverted to always-grouped, env keeps the variant, see "Tile GQA-Limit Experiment"; attention audit refreshed; all uncommitted), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
+| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion ported + validated (see "GDN Gate Fusion"), uncommitted), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
 | **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
 | **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -368,6 +368,7 @@ Validation (1x MI50 gfx906, ROCm 7.2.4, `build-llamacpp-rocm.sh` clean):
 | `REPACK_NOFOLD=1` | unset | Disable `ssm_out` `ne12` fold |
 | `GFXPROF=1` | unset | HIP-events per-op profiler |
 | `GGML_CUDA_FATTN_PATH=auto\|force_convert\|force_native` | `auto` | FATTN quantized-KV path selector (`2b620d7b9`): `auto` probes free mem vs `f16` shadow (20% headroom) per device, `force_*` overrides for bench. |
+| `GGML_CUDA_NO_ADD_UNARY_FUSION=1` | unset (fusion on) | GDN gate ADD -> softplus -> MUL (+ folded SIGMOID) fusion off (ported furnace `50798f69b`). Bit-exact, +1.3% tg on the 9B. |
 | `GGML_CUDA_FATTN_TILE_GQA=1` | unset (always-grouped, pre-experiment behavior) | 2026-11-09 experiment, see the Tile GQA-Limit section: any set value enables the `gqa_limit = 16` shape (grouped up to 16 query tokens, ungrouped `ncols2 = 1` beyond, only where an ungrouped site exists: DV <= 256, DKQ not 192/320). Wins -12.5% FA while the KV window fits L2, loses +6% once it crosses; default stays grouped. |
 | `GGML_CUDA_REPACK_Q4_0=1` / `GGML_CUDA_REPACK_IQ=1` | ON (0 opts out) | Q4_0 / IQ4_NL / IQ4_XS / IQ3_S repack, 2D weights only (`7f70fff53` port) |
 | `GGML_CUDA_Q3K_RELABEL=1` | ON (0 keeps 3-bit kernels) | Q3_K stored/computed as Q6_K planes (exact) |
@@ -770,6 +771,46 @@ Depth explains the flip: each FA call's KV working set grows with depth; at pp51
 Landed decision (revert): the gfx906 dispatch is back to always-grouped (pre-experiment behavior). `GGML_CUDA_FATTN_TILE_GQA` (any set value) re-enables the `gqa_limit = 16` shape (grouped up to 16 query tokens, ungrouped `ncols2 = 1` beyond), valid only for `DV <= 256 && DKQ != 192 && DKQ != 320` (`576/320/512-DV512`/192/320 have no ungrouped site - the first landing GGML_ABORT'ed there, caught by `test-backend-ops -o FLASH_ATTN_EXT`). Validation after the revert: 9B pp4096 per-op FA 318.5 ms / 2.4887 ms/call = the grouped number; FLASH_ATTN_EXT suite all OK; `build-llamacpp-rocm.sh` clean.
 
 Follow-up idea if ever revisited: a depth-conditional gqa_limit (ungrouped only while `K->ne[1] * DKQ * 4B * gqa_ratio` fits L2) would recover the shallow-fill win without the deep-prompt cost, for <1% pp in exchange for a dynamic dispatch rule - not taken under the simplicity bias. A dense-model (Spark dkq256) check is likewise pending with the reverted default.
+
+## Chunked GDN Prefill: measured and rejected (2026-11-09, no code landed)
+
+Source: mx-llama.cpp iacopPBK PR #2 (`1248e5e37`, 2026-08-08, merged into mx master) - a chunked `GATED_DELTA_NET` prefill kernel filling the TODO at `gated_delta_net.cu` (`launch_gated_delta_net`). The kernel lives at mx `ggml/src/ggml-cuda/gated_delta_net_chunk.cu/.cuh` (+331/16 lines, self-contained) plus a 15-line dispatch hook; re-applying is a drop-in (provenance header + hook at the TODO site). Not landed here.
+
+Mechanism: one (head, sequence) block loops over CS-token chunks (CS 64, 16 for the per-feature KDA gate) with the `S_v x S_v` recurrent state in registers across the whole prefill; one launch replaces the per-token step kernel. Engages when `!keep_rs` (K == 1, standard prefill) and `n_tokens >= 2*CS` and `S_v <= 128`; covers both the non-KDA branch (Qwen GDN, glm5-next, clef, bailingmoe3) and KDA (kimi-linear/k3/k3.1). Ships a dedicated `__gfx906__` branch with DPP/`ds_swizzle` warp reduces; the only wave64-sensitive line is the final `__shfl_xor_sync(0xffffffff, r, 32, 64)` stage - validated OK on wave64 by the S_v 64/128 test shapes.
+
+Measurement (9B qwen35 pp4096, 3x interleaved pairs, Pro VII, build f518082a3 + port):
+
+| variant | pp4096 t/s |
+|---|---:|
+| chunked (as shipped, 2 warps) | 961.8-968.6 |
+| chunked with 4-warp launcher | 971.02 +/- 2.23 |
+| per-token step kernel (base) | 989.1-999.2 |
+
+The chunked op runs ~315 ms vs the step kernel's 188.7 ms (+67%; e2e -3.1% consistent 3/3). The step kernel wins on CTA efficiency (4 column segments of 16 lanes each with cheap 16-lane reduces vs the chunk kernel's 2 warps x full-64-lane reduces) and its per-token costs (state round trips ~16 ms + launches ~10 ms at pp4096) are far below the gap at this shape. A 4-warps-per-CTA launcher variant recovers about a third of it but stays behind.
+
+Quality (measured while the port was in tree, for the record if ever revived): `test-backend-ops -o GATED_DELTA_NET -o GATED_DELTA_NET_CACHE_FUSION` 43/43 OK with the chunked route engaged (chunked shapes 64/127/256/65/100/200 tokens, KDA 64/33/100, K>1 snapshots, cache fusion). PPL 9B c1024x2 chunked `4.3786 / 6.2862` vs step `4.3684 / 6.2945` (within the +/- 0.49 bar; not bit-identical by construction). Build clean via the script.
+
+Revisit triggers: a Kimi-class model in the bench set (KDA chunk = 16 tokens, smaller S_v, possibly different CTA economics), or a future upstream/mx performance fix to the chunk kernel's column layout. Not worth keeping as an env on this card: every default-ON route regresses pp on the only models benched.
+
+## GDN Gate Fusion: ADD -> UNARY -> MUL + folded SIGMOID (2026-11-09, committed)
+
+Ported from furnace gfx906-perf `50798f69b` (sixvolts + Claude Opus 5.5, adapted). New `add_unary_mul_kernel<op>` + `ggml_cuda_op_add_unary_mul` in `unary.cu/.cuh` (+72) and a pattern hook in `ggml_cuda_try_fuse` (ggml-cuda.cu, +22): `softplus(alpha + dt_bias) * ssm_a` and the beta `sigmoid(beta_proj)` (when it is the next non-view node and independent) run in one launch per recurrent layer per token instead of three. Gate: `GGML_CUDA_NO_ADD_UNARY_FUSION=1`; the base `ggml_cuda_fusion_disabled()` global guard covers it too.
+
+Adapted to the base's newer fuse checker: furnace used the legacy 4-arg `ggml_can_fuse`; this tree calls `ggml_can_fuse_subgraph(cgraph, i, 3, {ADD, UNARY, MUL}, {i+2}, 1)` (the new API asserts a non-empty `outputs` list, so the MUL is declared the keep-node; ADD/UNARY uses must confine to the subgraph).
+
+Measurement (9B qwen35, Pro VII, 3x interleaved pairs, tg1024 + pp4096, GFXPROF nograph at n=1):
+
+| | fusion off | fusion on |
+|---|---:|---:|
+| launches per decode token (GFXPROF rows) | 50 ADD + 48 UNARY | 2 ADD + 48 fused |
+| serialized per-token GPU total | 131.0 | 120.9 |
+| tg1024 | 82.99 mean | 84.11 mean (**+1.3%**, 3/3) |
+| pp4096 | ~980.6/989.5 | ~986.5/991.5 (+0.3-0.7%, 2/2) |
+| PPL 9B c1024x2 | 4.3684 / 6.2945 | **4.3684 / 6.2945 (bit-identical)** |
+
+The beta SIGMOID fold-in is opportunistic (checks the same size, contiguity, no-data-overlap against the gate output and independence); it did not engage on qwen35-9B in this run - the win is the 3-node gate folding alone. Same-arithmetic per element, so PPL is bit-exact. `test-backend-ops -o UNARY -o ADD -o RMS_NORM -o GLU` all OK; `build-llamacpp-rocm.sh` clean.
+
+Applies to every GATED_DELTA_NET model (qwen3.5 family, Kimi KDA, glm5-next, clef, bailingmoe3). Donor's own reference on Qwen3.5-4B: launches 745 -> 634, tg256 +6.6%.
 
 ## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
 

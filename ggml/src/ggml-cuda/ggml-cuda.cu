@@ -5738,6 +5738,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // ADD -> UNARY -> MUL (the GDN gate softplus(alpha + dt_bias) * ssm_a), plus the beta SIGMOID when it is
+    // the next non-view node: one launch for both per recurrent layer. ggml_cuda_can_fuse only knows its
+    // whitelisted patterns, so the plain adjacency/single-use check applies here.
+    // (ported from furnace gfx906-perf 50798f69b, sixvolts + Claude Opus 5.5)
+    static const bool no_add_unary = getenv("GGML_CUDA_NO_ADD_UNARY_FUSION") != nullptr;
+    if (!no_add_unary && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        // the MUL output is the keep-node; ADD and UNARY must have uses confined to the subgraph
+        const enum ggml_op aum[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        const int out_idx[1]       = { i + 2 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 3, aum, out_idx, 1)) {
+            int j = i + 3;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            ggml_tensor * sig = nullptr;
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(cgraph->nodes[j]) == GGML_UNARY_OP_SIGMOID) {
+                sig = cgraph->nodes[j];
+            }
+            if (ggml_cuda_op_add_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], sig)) {
+                return sig != nullptr ? j - i : 2;
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
