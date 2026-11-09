@@ -778,6 +778,154 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rms_norm_f32_cuda(src0, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
+// two independent RMS_NORM -> SCALE pairs of the same shape in one launch (the GDN q and k l2 norms):
+// blockIdx.z / nsamples selects the pair; the body is rms_norm_f32<.., do_scale>'s, so results are
+// bit-identical to the two single launches. (ported from furnace gfx906-perf a2207dd89)
+template <int block_size, int vpt, bool do_vec>
+static __global__ void rms_norm_scale2_f32(const float * x0, float * dst0, const float * x1, float * dst1,
+        const int ncols, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float s) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int pair      = blockIdx.z / nsamples;
+    const int sample    = blockIdx.z % nsamples;
+    const int tid       = threadIdx.x;
+
+    const float * x   = pair == 0 ? x0 : x1;
+    float *       dst = pair == 0 ? dst0 : dst1;
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    float * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    extern __shared__ float s_sum[];
+
+    if constexpr (do_vec) {
+        const int ncols4 = ncols / 4;
+        const float4 * x4 = (const float4 *) x;
+        float4 * dst4 = (float4 *) dstc;
+        float4 xs[vpt];
+        float tmp = 0.0f;
+
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int i = tid + k*block_size;
+            if (i < ncols4) {
+                xs[k] = x4[i];
+                tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+            }
+        }
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+        const float scale = rsqrtf(tmp / ncols + eps);
+
+#pragma unroll
+        for (int k = 0; k < vpt; k++) {
+            const int i = tid + k*block_size;
+            if (i < ncols4) {
+                float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+                r.x *= s;
+                r.y *= s;
+                r.z *= s;
+                r.w *= s;
+                dst4[i] = r;
+            }
+        }
+    } else {
+        float tmp = 0.0f;
+
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+        const float scale = rsqrtf(tmp / ncols + eps);
+
+        for (int col = tid; col < ncols; col += block_size) {
+            dstc[col] = s * (scale * x[col]);
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor * n0, ggml_tensor * sc0, ggml_tensor * n1, ggml_tensor * sc1) {
+    const ggml_tensor * x0 = n0->src[0];
+    const ggml_tensor * x1 = n1->src[0];
+    if (x0->type != GGML_TYPE_F32 || x1->type != GGML_TYPE_F32 || sc0->type != GGML_TYPE_F32 || sc1->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(sc0) || !ggml_is_contiguous(sc1) || !ggml_are_same_shape(x0, x1) ||
+            !ggml_are_same_shape(sc0, sc1) || x0->nb[0] != sizeof(float) ||
+            x0->nb[1] != x1->nb[1] || x0->nb[2] != x1->nb[2] || x0->nb[3] != x1->nb[3] ||
+            sc0->src[0] != n0 || sc1->src[0] != n1 ||
+            memcmp(n0->op_params, n1->op_params, sizeof(float)) != 0 || memcmp(sc0->op_params, sc1->op_params, 2 * sizeof(float)) != 0) {
+        return false;
+    }
+    // the second pair must not read the first pair's output, and the outputs must not overlap
+    const char * a0 = (const char *) sc0->data; const char * a1 = a0 + ggml_nbytes(sc0);
+    const char * b0 = (const char *) sc1->data; const char * b1 = b0 + ggml_nbytes(sc1);
+    const char * r0 = (const char *) x1->data;  const char * r1 = r0 + ggml_nbytes(x1);
+    if ((a0 < b1 && b0 < a1) || (a0 < r1 && r0 < a1)) {
+        return false;
+    }
+    float eps, sv;
+    memcpy(&eps, n0->op_params, sizeof(float));
+    memcpy(&sv, (const float *) sc0->op_params + 0, sizeof(float));
+    // same launch shape the single-pair dispatch would pick for this shape, so results stay bit-identical
+    const int64_t ts = sizeof(float);
+    const int64_t s01 = x0->nb[1] / ts;
+    const int64_t s02 = x0->nb[2] / ts;
+    const int64_t s03 = x0->nb[3] / ts;
+    const dim3 blocks_num(x0->ne[1], MIN(x0->ne[2], UINT16_MAX), MIN(x0->ne[3], UINT16_MAX / 2) * 2);
+
+    const bool vec0 = (x0->ne[0] % 4 == 0) && ((uintptr_t) sc0->data & 15) == 0 && ggml_cuda_is_aligned(x0, 16);
+    const bool vec1 = (x1->ne[0] % 4 == 0) && ((uintptr_t) sc1->data & 15) == 0 && ggml_cuda_is_aligned(x1, 16);
+    if (vec0 != vec1) {
+        return false;
+    }
+    const bool vec = vec0;
+    const int n4 = (int) (x0->ne[0] / 4);
+
+#define RMS_NORM_SCALE2_LAUNCH(block, vpt, vec_run) \
+    do { \
+        const dim3 block_dims(block, 1, 1); \
+        const ggml_cuda_kernel_launch_params launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, ctx.stream()}; \
+        ggml_cuda_kernel_launch(rms_norm_scale2_f32<block, vpt, vec_run>, launch_params, \
+            (const float *) x0->data, (float *) sc0->data, (const float *) x1->data, (float *) sc1->data, \
+            (int) x0->ne[0], (int) x0->ne[3], s01, s02, s03, eps, sv); \
+    } while (0)
+
+    if (vec) {
+        if (x0->ne[2] > UINT16_MAX || x0->ne[3] > UINT16_MAX / 2) {
+            return false;
+        }
+        if (n4 <= 32) {
+            RMS_NORM_SCALE2_LAUNCH(32,   1, true);
+        } else if (n4 <= 128) {
+            RMS_NORM_SCALE2_LAUNCH(128,  1, true);
+        } else if (n4 <= 256) {
+            RMS_NORM_SCALE2_LAUNCH(256,  1, true);
+        } else if (n4 <= 512) {
+            RMS_NORM_SCALE2_LAUNCH(512,  1, true);
+        } else if (n4 <= 1024) {
+            RMS_NORM_SCALE2_LAUNCH(1024, 1, true);
+        } else if (n4 <= 4096) {
+            RMS_NORM_SCALE2_LAUNCH(1024, 4, true);
+        } else {
+            RMS_NORM_SCALE2_LAUNCH(1024, 1, false);
+        }
+    } else {
+        const int64_t nc = x0->ne[0];
+        if (x0->ne[2] > UINT16_MAX || x0->ne[3] > UINT16_MAX / 2) {
+            return false;
+        }
+        if (nc < 1024) {
+            RMS_NORM_SCALE2_LAUNCH(256,  1, false);
+        } else {
+            RMS_NORM_SCALE2_LAUNCH(1024, 1, false);
+        }
+    }
+#undef RMS_NORM_SCALE2_LAUNCH
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor) {
     const ggml_tensor * src0   = dst->src[0];
     float *             dst_d  = (float *) scale_tensor->data;

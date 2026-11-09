@@ -5737,6 +5737,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // the GDN q and k l2 norms: two RMS_NORM -> SCALE pairs back to back (views between) in one launch
+    // (ported from furnace gfx906-perf a2207dd89)
+    static const bool no_norm_pair = getenv("GGML_CUDA_NO_NORM_PAIR_FUSION") != nullptr;
+    if (!no_norm_pair && node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes) {
+        const enum ggml_op rs_ops[2] = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+        const int out0[1] = { i + 1 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 2, rs_ops, out0, 1)) {
+            int j = i + 2;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM) {
+                const int out1[1] = { j + 1 };
+                if (ggml_can_fuse_subgraph(cgraph, j, 2, rs_ops, out1, 1) &&
+                        ggml_cuda_op_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+                    return j + 1 - i;
+                }
+            }
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
         ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
