@@ -2038,7 +2038,8 @@ static __global__ void __launch_bounds__(256) gcn_f32_gemm_tn_rb_splitk(
 }
 
 static __global__ void __launch_bounds__(256) gcn_f32_splitk_reduce(
-        const float * __restrict__ part, float * __restrict__ y, const int64_t n, const int splits) {
+        const float * __restrict__ part, float * __restrict__ y, const int64_t n,
+        const int ne0, const int ldc, const int splits) {
     const int64_t i = (int64_t) blockIdx.x * 256 + threadIdx.x;
     if (i >= n) {
         return;
@@ -2047,7 +2048,7 @@ static __global__ void __launch_bounds__(256) gcn_f32_splitk_reduce(
     for (int z = 1; z < splits; z++) {
         acc += part[(size_t) z * n + i];
     }
-    y[i] = acc;
+    y[(i % ne0) + (i / ne0) * ldc] = acc;
 }
 
 // Skinny-M variant, M <= 16: one 256-thread block per output column n, K split over
@@ -2301,7 +2302,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 gcn_f32_gemm_skinny_launch(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
                     (int) ne01, (int) ne11, (int) ne10,
-                    (int) s01, (int) s11, (int) ne0, main_stream);
+                    (int) s01, (int) s11, (int) ldc, main_stream);
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
@@ -2330,18 +2331,18 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                         (const float *) src0_ptr, (const float *) src1_ptr, part.get(),
                         (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0, k_chunk, n_out);
                 }
-                gcn_f32_splitk_reduce<<<(n_out + 255) / 256, 256, 0, main_stream>>>(part.get(), (float *) dst_ptr, n_out, splits);
+                gcn_f32_splitk_reduce<<<(n_out + 255) / 256, 256, 0, main_stream>>>(part.get(), (float *) dst_ptr, n_out, (int) ne0, (int) ldc, splits);
                 CUDA_CHECK(cudaGetLastError());
                 return;
             }
             if (vec) {
                 gcn_f32_gemm_tn_rb<true><<<grid, block, 0, main_stream>>>(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
-                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0);
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc);
             } else {
                 gcn_f32_gemm_tn_rb<false><<<grid, block, 0, main_stream>>>(
                     (const float *) src0_ptr, (const float *) src1_ptr, (float *) dst_ptr,
-                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ne0);
+                    (int) ne01, (int) ne11, (int) ne10, (int) s01, (int) s11, (int) ldc);
             }
             CUDA_CHECK(cudaGetLastError());
             return;
