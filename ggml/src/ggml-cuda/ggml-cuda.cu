@@ -3692,6 +3692,11 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// exported for the conv-step fusion matchers (ported from furnace gfx906-perf 3a30ac2c2)
+bool ggml_cuda_is_view_or_noop_public(const ggml_tensor * t) {
+    return ggml_cuda_is_view_or_noop(t);
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
@@ -4886,6 +4891,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // recurrent conv step (decode / verify): CONCAT -> state-tail CPYs (+ SSM_CONV -> SILU) in one
+    // launch, with the conv-state GET_ROWS elided when it feeds only this step. Returns >= 0 iff handled.
+    if (node->op == GGML_OP_CONCAT) {
+        const int n = ggml_cuda_try_conv_step_fusion(*cuda_ctx, cgraph, i);
+        if (n >= 0) {
+            return n;
+        }
+    }
 
     // SIGMOID -> MUL -> ADD: b + a * sigmoid(g), g one value per row (shared-expert gate)
     if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID && i + 2 < cgraph->n_nodes) {
@@ -6085,6 +6099,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // a conv-state gather read in place by its fused conv step (ported furnace 3a30ac2c2)
+                if (node->op == GGML_OP_GET_ROWS && ggml_cuda_conv_state_gather_elidable(cgraph, node)) {
+                    continue;
+                }
+
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
                 }
@@ -6299,6 +6318,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     const bool disable_fusion = ggml_cuda_fusion_disabled();
+
+    // move the conv step's SSM_CONV -> SILU behind its CONCAT's state-tail CPYs so the step
+    // fusion covers them (pre-allocation; the moved nodes need only the concat and the weights)
+    if (!disable_fusion) {
+        ggml_cuda_conv_step_graph_optimize(cgraph);
+    }
 
     // move dense repacked Q8_0 matvecs that read the same activation next to each other so
     // ggml_cuda_try_fuse can run them in one launch (runs before allocation; a moved node only

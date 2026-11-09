@@ -14,7 +14,7 @@
 | **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
 | **Base date** | 2026-11-08 |
 | **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion ported + validated (see "GDN Gate Fusion"), uncommitted), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
+| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion + fused conv step ported and validated (see "GDN Gate Fusion", "Fused Recurrent Conv Step"), uncommitted), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
 | **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
 | **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -368,6 +368,7 @@ Validation (1x MI50 gfx906, ROCm 7.2.4, `build-llamacpp-rocm.sh` clean):
 | `REPACK_NOFOLD=1` | unset | Disable `ssm_out` `ne12` fold |
 | `GFXPROF=1` | unset | HIP-events per-op profiler |
 | `GGML_CUDA_FATTN_PATH=auto\|force_convert\|force_native` | `auto` | FATTN quantized-KV path selector (`2b620d7b9`): `auto` probes free mem vs `f16` shadow (20% headroom) per device, `force_*` overrides for bench. |
+| `GGML_CUDA_NO_CONV_STEP_FUSION=1` / `NO_CONV_STEP_CONV=1` | unset (fusion on) | GDN conv-step fusion (gather + concat + tail CPYs + SSM_CONV-SILU) off; the second env disables only the SILU absorption. See Fused Recurrent Conv Step. |
 | `GGML_CUDA_NO_ADD_UNARY_FUSION=1` | unset (fusion on) | GDN gate ADD -> softplus -> MUL (+ folded SIGMOID) fusion off (ported furnace `50798f69b`). Bit-exact, +1.3% tg on the 9B. |
 | `GGML_CUDA_FATTN_TILE_GQA=1` | unset (always-grouped, pre-experiment behavior) | 2026-11-09 experiment, see the Tile GQA-Limit section: any set value enables the `gqa_limit = 16` shape (grouped up to 16 query tokens, ungrouped `ncols2 = 1` beyond, only where an ungrouped site exists: DV <= 256, DKQ not 192/320). Wins -12.5% FA while the KV window fits L2, loses +6% once it crosses; default stays grouped. |
 | `GGML_CUDA_REPACK_Q4_0=1` / `GGML_CUDA_REPACK_IQ=1` | ON (0 opts out) | Q4_0 / IQ4_NL / IQ4_XS / IQ3_S repack, 2D weights only (`7f70fff53` port) |
@@ -811,6 +812,20 @@ Measurement (9B qwen35, Pro VII, 3x interleaved pairs, tg1024 + pp4096, GFXPROF 
 The beta SIGMOID fold-in is opportunistic (checks the same size, contiguity, no-data-overlap against the gate output and independence); it did not engage on qwen35-9B in this run - the win is the 3-node gate folding alone. Same-arithmetic per element, so PPL is bit-exact. `test-backend-ops -o UNARY -o ADD -o RMS_NORM -o GLU` all OK; `build-llamacpp-rocm.sh` clean.
 
 Applies to every GATED_DELTA_NET model (qwen3.5 family, Kimi KDA, glm5-next, clef, bailingmoe3). Donor's own reference on Qwen3.5-4B: launches 745 -> 634, tg256 +6.6%.
+
+## Fused Recurrent Conv Step (2026-11-09, committed)
+
+Ported from furnace gfx906-perf `3a30ac2c2` + `075dbfe61` (sixvolts + Claude Opus 5.5). For the GDN conv state on decode / verify batches: GET_ROWS(conv cache) -> RESHAPE -> CONCAT(state, x^T) and the state-tail CPYs run as one launch (`conv_step_concat_f32` in `ssm-conv.cu`, +334 lines; the gather is elided - the kernel reads the cache through the row indices - when nothing between the gather and the concat writes the cache rows or reuses the index memory; one thread per channel reads every sequence before writing any, so the multi-sequence write-under-read hazard is excluded). The SSM_CONV -> SILU that reads the concat is then absorbed into the same step kernel: `graph_optimize` moves it right behind the CONCAT's CPYs (`ggml_cuda_conv_step_graph_optimize`, pre-allocation; the moved nodes need only the concat and the conv weights), and the step computes silu(conv) per channel in `ssm_conv_f32<true>` order. Gates: `GGML_CUDA_NO_CONV_STEP_FUSION=1` (whole thing) and `GGML_CUDA_NO_CONV_STEP_CONV=1` (SILU absorption only; parity on this card - the base's SSM_CONV+ADD+SILU fusion already covers it - kept as a launch-count notch for when general fusion is off).
+
+Changes: `ssm-conv.cu` +251, `ssm-conv.cuh` +11, `ggml-cuda.cu` +26 (CONCAT hook first in `try_fuse`, the conv-state `GET_ROWS` elision continue in the capture loop, the graph_optimize call beside the q8-multi-group moves, `ggml_cuda_is_view_or_noop_public`).
+
+Validation (0.8B BF16 + 9B qwen35, Pro VII):
+
+- Launches at 1 decode token (GFXPROF nograph): CONCAT 36 -> 0, GET_ROWS 76 -> 40 (the 36 conv-state gathers elided on the 0.8B).
+- PPL, both models (c 1024, 2 chunks): bit-identical on/off (`0.8B 7.8077 / 13.0645`; `9B 4.3684 / 6.2945`).
+- tg1024 A/B (2x interleaved each): 0.8B 200.08-200.12 vs **202.85-205.98** (+1.4-3%); 9B 83.44-83.55 vs **84.82-85.21** (+1.6-2%).
+- Batched decode `-npp 128 -ntg 128 -npl 1,2,4,8` (S_TG, on vs off): B=1 205.9 vs 197.2 (+4.4%), B=2 312.9 vs 298.0 (+5.0%), B=4 435.7 vs 424.3 (+2.7%), B=8 422.5 vs 419.7 (+0.7%).
+- `test-backend-ops -o SSM_CONV -o GATED_DELTA_NET` all OK; `build-llamacpp-rocm.sh` clean.
 
 ## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
 
