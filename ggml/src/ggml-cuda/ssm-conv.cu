@@ -395,46 +395,36 @@ static bool conv_step_concat_ok(const ggml_tensor * cat) {
         x->nb[0] % sizeof(float) == 0 && ggml_is_contiguous(s0);
 }
 
-bool ggml_cuda_conv_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_tensor * gr) {
-    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr;
-    if (disabled || cgraph == nullptr) {
-        return false;
-    }
-    const ggml_tensor * cat = conv_step_concat_of(cgraph, gr, nullptr, nullptr);
-    return cat != nullptr && conv_step_concat_ok(cat);
-}
-
-int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr;
-    ggml_tensor * cat = cgraph->nodes[i];
-    if (disabled || !conv_step_concat_ok(cat)) {
-        return -1;
-    }
+// the CPY and absorb scans, shared by the step fusion and the gather-elision decision: both run at
+// eval time on the allocated graph. Fills the kernel args, including the state read source (the
+// elided cache + ids when elide, else the gathered result), and returns the last consumed node
+// index. That index equals the concat index when nothing beyond the concat is consumed - the fusion
+// must not launch then, and the conv-state gather must stay materialized, or the stock concat at
+// eval time would read it uncomputed.
+static int conv_step_scan(const ggml_cgraph * cgraph, int i, const ggml_tensor * cat,
+        const ggml_tensor * gr, conv_step_args * a, bool elide) {
     const ggml_tensor * s0 = cat->src[0];
     const ggml_tensor * x  = cat->src[1];
     const int SC = (int) s0->ne[0];
     const int T  = (int) x->ne[0];
     const int C  = (int) s0->ne[1];
     const int ns = (int) s0->ne[2];
-    conv_step_args a = {};
-    const ggml_tensor * gr = conv_step_root(s0);
-    if (gr->op == GGML_OP_GET_ROWS && ggml_cuda_conv_state_gather_elidable(cgraph, gr) &&
-            conv_step_concat_of(cgraph, gr, nullptr, nullptr) == cat) {
-        a.cache     = (const char *) gr->src[0]->data;
-        a.cache_nb1 = gr->src[0]->nb[1];
-        a.ids       = (const int32_t *) gr->src[1]->data;
-        a.ids_nb0   = gr->src[1]->nb[0];
+    if (elide) {
+        a->cache     = (const char *) gr->src[0]->data;
+        a->cache_nb1 = gr->src[0]->nb[1];
+        a->ids       = (const int32_t *) gr->src[1]->data;
+        a->ids_nb0   = gr->src[1]->nb[0];
     } else {
-        a.s0 = (const char *) s0->data; a.s0_nb1 = s0->nb[1]; a.s0_nb2 = s0->nb[2];
+        a->s0 = (const char *) s0->data; a->s0_nb1 = s0->nb[1]; a->s0_nb2 = s0->nb[2];
     }
-    a.x = (const char *) x->data; a.x_nb0 = x->nb[0]; a.x_nb1 = x->nb[1]; a.x_nb2 = x->nb[2];
-    a.out = (float *) cat->data;
-    a.C = C; a.T = T; a.n_seqs = ns;
+    a->x = (const char *) x->data; a->x_nb0 = x->nb[0]; a->x_nb1 = x->nb[1]; a->x_nb2 = x->nb[2];
+    a->out = (float *) cat->data;
+    a->C = C; a->T = T; a->n_seqs = ns;
 
     // the CPYs right after the concat that write state tails of it into the cache
     int last = i;
     const ggml_tensor * cache = gr->op == GGML_OP_GET_ROWS ? conv_step_root(gr->src[0]) : nullptr;
-    for (int k = i + 1; k < cgraph->n_nodes && a.n_cpy < CONV_STEP_MAX_CPY; k++) {
+    for (int k = i + 1; k < cgraph->n_nodes && a->n_cpy < CONV_STEP_MAX_CPY; k++) {
         const ggml_tensor * n = cgraph->nodes[k];
         if (ggml_cuda_is_view_or_noop_public(n) || ggml_is_empty(n)) {
             continue;
@@ -451,10 +441,10 @@ int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_c
                 (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             break;
         }
-        a.cpy[a.n_cpy].dst     = (char *) dst->data;
-        a.cpy[a.n_cpy].dst_nb1 = dst->nb[1];
-        a.cpy[a.n_cpy].col0    = (int) (src->view_offs / sizeof(float));
-        a.n_cpy++;
+        a->cpy[a->n_cpy].dst     = (char *) dst->data;
+        a->cpy[a->n_cpy].dst_nb1 = dst->nb[1];
+        a->cpy[a->n_cpy].col0    = (int) (src->view_offs / sizeof(float));
+        a->n_cpy++;
         last = k;
     }
     // the SSM_CONV -> SILU that reads the concat, when only views sit between it and the last CPY
@@ -482,20 +472,55 @@ int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_c
             // y on top of x is fine when the layouts match: each thread then overwrites only elements it has read
             const bool x_alias = silu->data == x->data && x->nb[0] == (size_t) C * sizeof(float) && x->nb[1] == sizeof(float) &&
                 x->nb[2] == (size_t) T * C * sizeof(float);
-            bool clash = (ovl(x) && !x_alias) || ovl(cat) || ovl(w) || (a.cache == nullptr && ovl(s0));
-            if (a.cache != nullptr) {
+            bool clash = (ovl(x) && !x_alias) || ovl(cat) || ovl(w) || (a->cache == nullptr && ovl(s0));
+            if (a->cache != nullptr) {
                 clash = clash || ovl(gr->src[0]) || ovl(gr->src[1]);
             }
             if (!clash) {
-                a.conv_w     = (const float *) w->data;
-                a.conv_w_nb1 = w->nb[1];
-                a.y          = (float *) silu->data;
-                last         = k + 1;
+                a->conv_w     = (const float *) w->data;
+                a->conv_w_nb1 = w->nb[1];
+                a->y          = (float *) silu->data;
+                last          = k + 1;
             }
         }
     }
+    return last;
+}
+
+bool ggml_cuda_conv_state_gather_elidable(const ggml_cgraph * cgraph, const ggml_tensor * gr) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr;
+    if (disabled || cgraph == nullptr) {
+        return false;
+    }
+    int ci = 0;
+    const ggml_tensor * cat = conv_step_concat_of(cgraph, gr, nullptr, &ci);
+    if (cat == nullptr || !conv_step_concat_ok(cat)) {
+        return false;
+    }
+    // elide only when the fused step consumes beyond the concat; on those shapes the step keeps
+    // running, so the gather decision and the fusion stay consistent
+    conv_step_args a = {};
+    return conv_step_scan(cgraph, ci, cat, gr, &a, true) > ci;
+}
+
+int ggml_cuda_try_conv_step_fusion(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_CONV_STEP_FUSION") != nullptr;
+    ggml_tensor * cat = cgraph->nodes[i];
+    if (disabled || !conv_step_concat_ok(cat)) {
+        return -1;
+    }
+    const ggml_tensor * gr = conv_step_root(cat->src[0]);
+    const bool elide = gr->op == GGML_OP_GET_ROWS && ggml_cuda_conv_state_gather_elidable(cgraph, gr) &&
+        conv_step_concat_of(cgraph, gr, nullptr, nullptr) == cat;
+    conv_step_args a = {};
+    const int last = conv_step_scan(cgraph, i, cat, gr, &a, elide);
+    if (last == i) {
+        // nothing beyond the concat is consumed: launching would leave the walk to re-run the stock
+        // concat over an elided gather; run everything stock instead
+        return -1;
+    }
     const int nt = 256;
-    conv_step_concat_f32<3><<<(C + nt - 1) / nt, nt, 0, ctx.stream()>>>(a);
+    conv_step_concat_f32<3><<<(a.C + nt - 1) / nt, nt, 0, ctx.stream()>>>(a);
     return last - i;
 }
 

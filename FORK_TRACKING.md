@@ -828,6 +828,34 @@ Validation (0.8B BF16 + 9B qwen35, Pro VII):
 - Batched decode `-npp 128 -ntg 128 -npl 1,2,4,8` (S_TG, on vs off): B=1 205.9 vs 197.2 (+4.4%), B=2 312.9 vs 298.0 (+5.0%), B=4 435.7 vs 424.3 (+2.7%), B=8 422.5 vs 419.7 (+0.7%).
 - `test-backend-ops -o SSM_CONV -o GATED_DELTA_NET` all OK; `build-llamacpp-rocm.sh` clean.
 
+### MTP corruption fixed 2026-11-12 (elision / fusion decision mismatch)
+
+Live server with `--spec-type draft-mtp` (Kestrel-4B-Coder Q8_0, qwen35) decoded garbage after about
+a sentence, deterministic at temp 0. The conv-state GET_ROWS elision and the step fusion decided
+independently: the eval walk skipped the gather whenever a qualifying concat exists, while the
+concat-side scan could end with nothing consumed beyond the concat (launch + skip 0). MTP graphs
+produce those shapes - the verify and draft-head steps have no state-tail CPYs (the fused GDN op
+writes the conv cache itself) and the SILU absorb declines - and with nothing consumed the walk
+re-ran the stock CONCAT over the elided, never-computed gather result, clobbering the kernel's
+correct output with uninitialized memory. Plain decode graphs always have tails or absorb (skip
+1-3), which is why they stayed bit-identical and why PPL/tg missed it.
+
+Fix: one shared scan (`conv_step_scan` in `ssm-conv.cu`) now backs both decisions -
+`conv_state_gather_elidable` requires `last > cat_idx`, and the fusion returns -1 on `last == i`
+(stock gather + concat + conv for those shapes). A temp trace env (`GGML_CUDA_TRACE_CONV_STEP`,
+removed with the fix) showed the skip-0 engagements in the MTP graphs; an elision-off toggle gave
+the clean control run.
+
+Validation (fix on, 1x Pro VII): Kestrel server with MTP on and off, byte-identical outputs to
+`GGML_CUDA_NO_CONV_STEP_FUSION=1` on the live reproducer + 3x 600-token long prompts + a two-turn
+conversation; `test-backend-ops -b ROCm0 -o SSM_CONV -o GATED_DELTA_NET` 43/43; PPL bit-identical
+(0.8B `7.8077 / 13.0645`, 9B `4.3684 / 6.2945`); batched decode TG with the fused path intact
+(B=1 204.7 vs 199.7 off, B=8 412.2 vs 391.7 off).
+
+Protocol note: the original conv-step validation had no sampled-text check with MTP engaged, and
+tg runs recorded t/s only - the corruption was invisible to both. Sampled greedy text + a
+determinism check now belong to the conv-step validation set.
+
 ## GDN q/k Norm-Pair Fusion (2026-11-09, committed)
 
 Ported from furnace gfx906-perf `a2207dd89` (sixvolts + Claude Opus 5.5), adapted for bit-exactness. Two same-shape RMS_NORM -> SCALE pairs back to back (the GDN q and k l2 norms, views in between) run as one launch: `rms_norm_scale2_f32<block, vpt, vec>` in `norm.cu` (+105) picks the pair with `blockIdx.z / nsamples`, launch shape matching the single-pair dispatch table exactly (block/vpt/vec by n4, shared 32 floats when block > WARP_SIZE). Hook first in the RMS_NORM branch of `ggml_cuda_try_fuse` via `ggml_can_fuse_subgraph({RMS_NORM, SCALE}, {i+1})` for both pairs, views skipped between; host rejects differing strides/eps/scale/bias, misaligned pairs (vec0 != vec1), and output/input overlaps (sc0 vs sc1, sc0 vs x1). Grid z doubled, guarded `nsamples <= 32767` (otherwise the single path). `GGML_CUDA_NO_NORM_PAIR_FUSION=1` opts out. Note: the furnace kernel's `s * (scale*x) + b` body was replaced by this tree's `rms_norm_f32<.., do_scale>` arithmetic (`make_float4(scale*v)` then `*s` in the vec path, `s * (scale*x)` in the scalar path) so results are bit-identical to the two single launches, and SCALE's 2 params (s, bias=0) carry over from the base fuse wrapper.
