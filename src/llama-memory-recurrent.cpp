@@ -293,6 +293,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+            // a pending rollback of the old destination must not apply to the copied cell
+            if ((size_t) seq_id_dst < rs_idx.size()) {
+                rs_idx[seq_id_dst] = 0;
+            }
         }
     }
 }
@@ -1379,3 +1383,4 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     }
     return (int32_t)(idx * mem->size) + src0;
 }
+
