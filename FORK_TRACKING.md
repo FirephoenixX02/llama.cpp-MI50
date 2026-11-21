@@ -14,7 +14,7 @@
 | **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
 | **Base date** | 2026-11-08 |
 | **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion, fused conv step and the q/k norm-pair fusion ported + validated (see "GDN Gate Fusion", "Fused Recurrent Conv Step", "GDN q/k Norm-Pair Fusion"), committed through the norm-pair entry), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
+| **Last doc update** | 2026-11-21 (memory rollback fixes ported from furnace `f654124d8` + `9bdf9fb00`, see "Memory rollback snapshot fixes"; no new generic perf in furnace since 2026-11-01 - tail is QSA sparse-decode streams, server, memory-rollback correctness), 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion, fused conv step and the q/k norm-pair fusion ported + validated (see "GDN Gate Fusion", "Fused Recurrent Conv Step", "GDN q/k Norm-Pair Fusion"), committed through the norm-pair entry), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
 | **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
 | **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -148,6 +148,9 @@ Key pillars:
 | 86 | `2aa788490` | 2026-11-06 | `docs: gfx906 ISA optimization notes + build-object register audit tool` | Docs / Tooling | fork-original |
 | 87 | `ffc7e39c1` | 2026-11-06 | `cuda: lds_nc column groups of 4 for NC = 6..8; rms_norm_mul_rope SGPR slim` | Perf / Repack + Rope | fork-original (restructure of the `69db7bf5d` port + notes sec. 12 SGPR slim); validated same day, see below |
 | 88 | this commit | 2026-11-06 | `docs: lds_nc column-group + rope WIP validation results` | Docs | fork-original |
+| 89 | `bfc8153e1` | 2026-11-12 | `cuda: fix MTP garbage from the fused conv step consuming nothing` | Fix / Fusion | fork-original (shared conv-step scan backs both the elision and the fusion decisions) |
+| 90 | `0e592c9fb` | 2026-11-21 | `llama-memory : do not apply the destination's pending rollback to a cell added by seq_cp` | Fix / Memory | port of furnace `f654124d8` (sixvolts); hybrid-idx hunk QSA-only, excluded |
+| 91 | `09dae7007` | 2026-11-21 | `llama-memory : move the rollback snapshots of a cell that find_slot displaces` | Fix / Graph + Memory | port of furnace `9bdf9fb00` (sixvolts), adapted to the refactored `build_rs` (no `s_copy_extra`, plane count from the gather) |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`51d1cf038`, `4e78727bc`) credit the furnace source commit in the body.
 >
@@ -861,6 +864,36 @@ determinism check now belong to the conv-step validation set.
 Ported from furnace gfx906-perf `a2207dd89` (sixvolts + Claude Opus 5.5), adapted for bit-exactness. Two same-shape RMS_NORM -> SCALE pairs back to back (the GDN q and k l2 norms, views in between) run as one launch: `rms_norm_scale2_f32<block, vpt, vec>` in `norm.cu` (+105) picks the pair with `blockIdx.z / nsamples`, launch shape matching the single-pair dispatch table exactly (block/vpt/vec by n4, shared 32 floats when block > WARP_SIZE). Hook first in the RMS_NORM branch of `ggml_cuda_try_fuse` via `ggml_can_fuse_subgraph({RMS_NORM, SCALE}, {i+1})` for both pairs, views skipped between; host rejects differing strides/eps/scale/bias, misaligned pairs (vec0 != vec1), and output/input overlaps (sc0 vs sc1, sc0 vs x1). Grid z doubled, guarded `nsamples <= 32767` (otherwise the single path). `GGML_CUDA_NO_NORM_PAIR_FUSION=1` opts out. Note: the furnace kernel's `s * (scale*x) + b` body was replaced by this tree's `rms_norm_f32<.., do_scale>` arithmetic (`make_float4(scale*v)` then `*s` in the vec path, `s * (scale*x)` in the scalar path) so results are bit-identical to the two single launches, and SCALE's 2 params (s, bias=0) carry over from the base fuse wrapper.
 
 Measurement (0.8B qwen35 decode, GFXPROF nograph n=1): serialized per-token 92.5 -> 89.5 ms (-3.2%). tg1024 (2x interleaved): 0.8B 206.87-207.76 -> 207.68-209.43 (+0.8%); 9B 86.53-86.68 vs 86.54-86.77 (+0.1%, parity at that scale). PPL bit-identical on both models (constants unchanged). `test-backend-ops -o RMS_NORM -o GATED_DELTA_NET -o UNARY` all OK; build clean.
+
+## Memory rollback snapshot fixes (2026-11-21)
+
+Ported from furnace gfx906-perf `f654124d8` + `9bdf9fb00` (sixvolts, 2026-11-07), adapted to the
+upstream-refactored `build_rs`: this tree has no `s_copy_extra` - the custom-getter path gathers
+`s_copy_tail` (a view of s_copy from row 1 to the end), and the extra copy derives the plane count
+from the gather size (`1 + (ne[0] + i0 - n_rs)/n_extra`, asserted consistent) instead of extra
+view shapes. `rs_size` left its `GGML_UNUSED` and is the plane stride again. Two fixes:
+
+- `seq_cp`: clear the destination's pending rollback (`rs_idx[seq_id_dst] = 0`) so it cannot roll
+  back the cell it now shares with the source. C-API reachable only (the server clears the
+  destination before `seq_cp`). The shared-cell `seq_rm` refuse of the same donor commit is already
+  upstream (`b9acf138a`) - only the seq_cp hunk ported. Hybrid-idx hunks are QSA-only, excluded.
+- displaced cells: `s_copy` is sized `n_rs + (n_rs - n_seqs)*n_rs_seq` (`get_n_s_copy`),
+  `set_input_s_copy` fills the plane-0 rows plus the snapshot planes `1..n_rs_seq` of the extra
+  cells (plain `src0 + p*mem->size`, no pending-idx offset), and the extra copy writes every plane
+  through a `[state_size, n_extra, 1 + n_rs_seq]` view (plane stride `rs_size`). Before, the extra
+  copy moved only plane 0, so a cell displaced by find_slot lost its snapshots and a later rollback
+  read another sequence's state (spec verify step in the first ubatch, then a ubatch whose cells
+  straddle it). `n_rs_seq > 0` engages with the speculative types that need rs rollback
+  (`common/common.h need_n_rs_seq`) and changes no graph ops otherwise.
+
+Validation (only `llama`, `llama-perplexity`, `test-backend-ops` linked; the `llama-cli` target
+fails on the inert `llama-ui-assets` rule, pre-existing, unrelated):
+- `test-backend-ops -b ROCm0 -o GATED_DELTA_NET` OK; full `llama` + tools build clean (host TUs only).
+- PPL bit-identical to the recorded refs: 0.8B BF16 `7.8077 / 13.0645`, 9B UD-Q4_K_XL
+  `4.3684 / 6.2945` (c 1024, 2 chunks), and `7.8077 / 13.0645` again at `-b 512` (n_seq 2).
+- Both commits exercise no numeric change at `n_rs_seq = 0`; the planes path only engages with
+  speculative rollback contexts. A live n_rs_seq > 0 check (draft-mtp server) is still open, as
+  before for any snapshot-path change.
 
 ## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
 
