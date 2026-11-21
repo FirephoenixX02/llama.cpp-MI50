@@ -187,6 +187,11 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // s_copy holds the n_rs plane-0 sources, then planes 1..n_rs_seq of the n_rs - n_seqs extra cells, so
+    // that a cell moved by find_slot keeps its rollback snapshots; the extra copy uses every plane or none
+    uint32_t get_n_s_copy      (uint32_t n_seqs) const;
+    void set_input_s_copy(int32_t * data, uint32_t n_seqs) const;
+
 private:
     const llama_memory_status status;
 

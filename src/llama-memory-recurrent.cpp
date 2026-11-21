@@ -1384,3 +1384,24 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     return (int32_t)(idx * mem->size) + src0;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_s_copy(uint32_t n_seqs) const {
+    const uint32_t n_rs = get_n_rs();
+    return n_rs + (n_rs - n_seqs)*mem->n_rs_seq;
+}
+
+void llama_memory_recurrent_context::set_input_s_copy(int32_t * data, uint32_t n_seqs) const {
+    const uint32_t n_rs    = get_n_rs();
+    const uint32_t n_extra = n_rs - n_seqs;
+
+    // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+    for (uint32_t i = 0; i < n_rs; ++i) {
+        data[i] = s_copy(i);
+    }
+
+    // planes 1..n_rs_seq of the extra cells: a cell moved by find_slot also needs its rollback snapshots
+    for (uint32_t p = 1; p <= mem->n_rs_seq; ++p) {
+        for (uint32_t j = 0; j < n_extra; ++j) {
+            data[n_rs + (p - 1)*n_extra + j] = (int32_t) ((size_t) p*mem->size) + mem->cells[n_seqs + j + mem->head].src0;
+        }
+    }
+}
