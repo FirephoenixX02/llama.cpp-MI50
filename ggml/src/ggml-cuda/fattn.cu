@@ -708,15 +708,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    // only the MMA kernel reads K/V through kv_rows
+    // the MMA kernel on Turing+, the tile and vector kernels on GCN read K/V through kv_rows
     if (kv_rows) {
-        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
-            BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
+        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        if (!(GGML_CUDA_CC_IS_GCN(cc) && mask)) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        // fall through to the regular vector/tile selection
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && n_kv % FATTN_KQ_STRIDE == 0;
 
 #if defined(GGML_USE_HIP)
     // HIP quantized-KV TILE/MMA paths materialize large F16 temporary buffers;
