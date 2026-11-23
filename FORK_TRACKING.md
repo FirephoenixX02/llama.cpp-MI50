@@ -13,8 +13,8 @@
 | **Local branch** | `gfx906/mi50-optimization` rebased onto `master` = `a691b2345` (2026-11-08), 99 commits ahead, clean |
 | **Base / merge-base** | `a691b2345` - `webgpu : add COUNT_EQUAL support (#31578)` |
 | **Base date** | 2026-11-08 |
-| **Commits ahead of base** | 99 on `HEAD` (`git rev-list --count origin/master..HEAD`) |
-| **Last doc update** | 2026-11-21 (memory rollback fixes ported from furnace `f654124d8` + `9bdf9fb00`, see "Memory rollback snapshot fixes"; no new generic perf in furnace since 2026-11-01 - tail is QSA sparse-decode streams, server, memory-rollback correctness), 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion, fused conv step and the q/k norm-pair fusion ported + validated (see "GDN Gate Fusion", "Fused Recurrent Conv Step", "GDN q/k Norm-Pair Fusion"), committed through the norm-pair entry), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
+| **Commits ahead of base** | 115 on `HEAD` (`git rev-list --count a691b2345..HEAD`) |
+| **Last doc update** | 2026-11-23 (FATTN `kv_rows` in the GCN tile and vector kernels: SWA layers walk only the window list, multi-sequence ubatches get per-slice lists, see "FATTN kv_rows on the GCN kernels"), 2026-11-21 (memory rollback fixes ported from furnace `f654124d8` + `9bdf9fb00`, see "Memory rollback snapshot fixes"; no new generic perf in furnace since 2026-11-01 - tail is QSA sparse-decode streams, server, memory-rollback correctness), 2026-11-09 (HIP fast-math flags: compile/IR/ISA + op-tests 288/288 + same-host A/B, neutral on bench models; GCN F32 GEMM chunk-`ldc` fix; fattn-tile GQA-limit experiment (default reverted to grouped, env variant); chunked GDN prefill (mx iacopPBK PR #2) measured +67% op-level at qwen35 pp4096 and rejected, kept as a doc finding; attention audit refreshed; GDN gate fusion, fused conv step and the q/k norm-pair fusion ported + validated (see "GDN Gate Fusion", "Fused Recurrent Conv Step", "GDN q/k Norm-Pair Fusion"), committed through the norm-pair entry), 2026-11-08 (rebase onto `a691b2345`; MMID tile-spec adaptation + per-chunk HIP graph guard, see "Rebase 2026-11-08" below; all branch SHAs rewritten; + FATTN quantized-KV decode GQA-gap measured on the Pro VII, see "FATTN Decode Attention" below; grouped-VEC candidate built + measured (2-3x worse at every depth) + reverted same day, tree matches `f518082a3`) |
 | **Upstream `origin/master`** | `a691b2345` (2026-11-08) - rebase done, see "Rebase 2026-11-08" below |
 | **Backup** | `backup/mi50-pre-rebase-20261108` at `270fc1275` (pre-rebase HEAD), plus the older `backup/mi50-pre-rebase-20261018` at `87f850290` |
 | **Donor** | `furnace/gfx906-perf` at `fc353a5ac` (2026-10-04, sixvolts) - 11 single-GPU generic opts ported, GDN/qwen4exp/server/tests-only excluded; round 2 at `4f30c1bda` (2026-11-01) - LDS rows, deterministic top-k, per-type switches, M-RoPE fusion (see below) |
@@ -52,7 +52,7 @@ Key pillars:
 2. **Repacked MMQ GEMM for prefill** - 2D-tiled dp4a GEMM consuming repacked planes directly.
 3. **Multi-quant + broadcast + MoE extensions** - Q5_K/Q6_K/Q8_0/Q3_K in repacked path, 2D weight x 3D activation broadcast (GDN hybrid), 3D MUL_MAT_ID / expert-stack.
 4. **Concurrent-decode batching** - batched `ncols` matvecs and MoE per-token loops so 2-8 slots scale.
-5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, GCN `supports_op` gate fix (FILL/TRI/DIAG), per-op profiler, ssm-conv / async memcpy / FATTN mask / HIP graph kernel guard / `J_max` padding fixes, Vega20 MMQ tuning (`Q6_K` `I=64 occ2`), native `q8_0` FATTN tile (shadow skip, `GGML_CUDA_FATTN_PATH`).
+5. **GCN-specific correctness + micro-opts** - DPP warp reductions, `solve_tri` fix, GCN `supports_op` gate fix (FILL/TRI/DIAG), per-op profiler, ssm-conv / async memcpy / FATTN mask / HIP graph kernel guard / `J_max` padding fixes, Vega20 MMQ tuning (`Q6_K` `I=64 occ2`), native `q8_0` FATTN tile (shadow skip, `GGML_CUDA_FATTN_PATH`), FATTN `kv_rows` on the tile and vector kernels (SWA window lists, per-slice lists).
 
 ---
 
@@ -151,6 +151,8 @@ Key pillars:
 | 89 | `bfc8153e1` | 2026-11-12 | `cuda: fix MTP garbage from the fused conv step consuming nothing` | Fix / Fusion | fork-original (shared conv-step scan backs both the elision and the fusion decisions) |
 | 90 | `0e592c9fb` | 2026-11-21 | `llama-memory : do not apply the destination's pending rollback to a cell added by seq_cp` | Fix / Memory | port of furnace `f654124d8` (sixvolts); hybrid-idx hunk QSA-only, excluded |
 | 91 | `09dae7007` | 2026-11-21 | `llama-memory : move the rollback snapshots of a cell that find_slot displaces` | Fix / Graph + Memory | port of furnace `9bdf9fb00` (sixvolts), adapted to the refactored `build_rs` (no `s_copy_extra`, plane count from the gather) |
+| 92 | `585b8400a` | 2026-11-23 | `cuda: read K/V through kv_rows in the GCN tile and vector kernels` | Perf / FATTN | fork-original (MMA-only gate; SWA window lists + per-slice lists) |
+| 93 | `this commit` | 2026-11-23 | `docs: update FORK_TRACKING for FATTN kv_rows on GCN` | Docs | fork-original |
 
 > `git log --reverse --oneline origin/master..HEAD` reproduces this order. Furnace ports keep original `Author: sixvolts <rigel@sixvolts.org>` and `Co-Authored-By: Claude` trailers via cherry-pick; manual guards (`51d1cf038`, `4e78727bc`) credit the furnace source commit in the body.
 >
@@ -894,6 +896,80 @@ fails on the inert `llama-ui-assets` rule, pre-existing, unrelated):
 - Both commits exercise no numeric change at `n_rs_seq = 0`; the planes path only engages with
   speculative rollback contexts. A live n_rs_seq > 0 check (draft-mtp server) is still open, as
   before for any snapshot-path change.
+
+## FATTN kv_rows on the GCN kernels (2026-11-23, committed `585b8400a`)
+
+`ggml_flash_attn_ext_rows` - attention over an explicit K/V cell list per slice, used by the
+unified KV cache (`cparams.fused_kv_rows`, default on with `kv_unified`) - was implemented only in
+the NVIDIA MMA kernel. On gfx906 `ggml_cuda_flash_attn_ext_supported()` returned false, the fused-op
+probe disabled the feature, and attention fell back to a dense mask over the whole cache range.
+
+Both GCN kernels now read row i of a KV chunk through the per-slice list
+(`KV_rows_ptr + sequence*ne11`); negative entries (list padding) read row 0 and stay masked, the
+same convention as the MMA kernel. What the list changes, and why it is worth more than the
+multi-sequence case alone:
+
+- SWA layers: `get_kv_rows_slices` starts the list at the sliding-window `p_min`, so the kernel
+  walks only the window. The dense fallback keeps the full range: `flash_attn_mask_to_KV_max` can
+  only trim trailing all-`-inf` blocks, not the leading out-of-window columns. On Spark-X2.6-4B
+  (`n_swa` 512, 30 of 36 layers SWA) a 1-token decode at 2K context attends 512 columns instead of
+  2304. This is the main single-sequence win on GCN.
+- Multi-sequence ubatches: each slice gets its own list instead of the union of the whole unified
+  cache (see the B=2/B=4 rows below).
+- A single non-SWA sequence whose cells are the whole used range: nothing to skip, so the kernel
+  does the same work (plus the gather).
+
+Changes: `fattn-tile.cuh` +89/-33, `fattn-vec.cuh` +25/-6, `fattn.cu` +6/-3,
+`tests/test-backend-ops.cpp` +12/-3.
+
+- `fattn-tile.cuh`: the six tile loaders (f16 half2/float, q8_0 half2/float, q4_0 half2/float) are
+  templated on `gather`; the dense instance keeps the original address math and the gather
+  instance applies the row list. The row-list branch is taken once per loader call, not per row:
+  a per-row `gather ? rows[i] : i_KV_0 + i` select removed the 64-bit multiply the unrolled copy
+  loop used to hoist and measured 7% slower on the *dense* path (FA 400 vs 429 ms at the
+  Spark 4B 2048-token prefill/decode mix), so `gather == false` reproduces the old code exactly.
+  The kernel forwards the list through `flash_attn_tile_iter`/`iter_KQ`.
+- `fattn-vec.cuh`: same row indirection for Q <= 2; the base pointers stay per head/slice and the
+  list supplies the row. One list load per lane per KV chunk, broadcast with `__shfl_sync`; a
+  direct per-row read measured 13% TG worse at 8K (Spark 4B q8_0 KV: 78-80 vs 90 t/s) because the
+  load sat on the critical path of every V row.
+- `fattn.cu:711`: `kv_rows` on GCN falls through to the regular vector/tile heuristic instead of
+  returning TILE, so q8_0/q4_0 decode at Q <= 2 is VEC again and needs no f16 shadow. The
+  `use_gqa_opt` check in `launch_fattn_tile_switch_ncols2` derives the KV length from the list when
+  present (otherwise `K->ne[1]`), so the 192/320/512/576 tile dispatch cannot abort on a rows op.
+
+Measured (Radeon Pro VII, ROCm 7.2.4, `llama-batched-bench -fa on -kvu`, rows on vs
+`LLAMA_KV_ROWS_DISABLE=1`; on/off pairs back to back, one pass unless noted):
+
+| case | kv | PP on/off (t/s) | TG on/off (t/s) |
+|---|---|---|---|
+| Spark 4B, 512+64 t, B=1 | f16 | 2088/2045 | 111.6/112.6 (-0.9%) |
+| Spark 4B, 512+64 t, B=1 | q8_0 | 2025/1995 | 98.3/100.3 (-2.0%, 4 interleaved pairs) |
+| Spark 4B, 2048+64 t, B=1 | f16 | 1918-1921/1921-1930 | 110.2/104.1 (+5.9%, 2 pairs) |
+| Spark 4B, 2048+64 t, B=1 | q8_0 | 1885/1903 | 97.5-97.9/93.0-93.6 (+4.7%, 2 pairs) |
+| Spark 4B, 8192+32 t, B=1 | f16 | - | 105.0/96.7 (+8.6%) |
+| Spark 4B, 8192+32 t, B=1 | q8_0 | - | 88.0/84.8 (+3.8%) |
+| Spark 4B, 512+64 t, B=2 | f16 | 2095/1958 (+7.0%) | 187.0/170.4 (+9.8%) |
+| Spark 4B, 512+64 t, B=4 | f16 | 2095/1798 (+16.5%) | 267.3/253.2 (+5.6%) |
+| Spark 4B, 512+64 t, B=2 | q8_0 | 2003/1911 (+4.8%) | 165.7/149.8 (+10.6%) |
+| Spark 4B, 512+64 t, B=4 | q8_0 | 2048/1752 (+16.9%) | 230.5/229.1 (+0.6%) |
+| Spark 4B, 2048-token ubatch, 2 seq | f16 | 1883/1733 (+8.6%) | 183.9/147.2 (+24.9%) |
+| Spark 4B, 2048-token ubatch, 2 seq | q8_0 | 1858/1706 (+8.9%) | 156.9/124.8 (+25.7%) |
+
+The B=1 512-token pair is the non-SWA case (window covers the cache): f16 parity, q8_0 about -2%
+from the vector gather. Tile at depth was ~2-3% behind VEC before the vector change and now the
+two kernels trade places by depth; no depth-conditional kernel choice was added. Ubatch-level
+PP gains grow with the number of sequences: each slice's prefill attention stops covering the
+other slots' cells, and the KQ mask tensor plus its CPU fill shrink from `n_tokens * n_kv` to
+`n_tokens * n_kv_rows` halves per ubatch.
+
+Validation: `test-backend-ops -b ROCm0 -o FLASH_ATTN_EXT` 4378/4378, including 74 `kv_rows` cases
+(`nb` 1..512, `n_slices` 1/4, f16 and q8_0, shuffled per-slice row lists, plus `nb=2` and two
+`max_bias=8` ALiBi cases added so the vector kernel's `ncols=2` and f16 routes are covered).
+PPL 0.8B BF16 c1024x2 is bit-identical to the dense fallback (`13.0645`, matches the recorded
+reference); q8_0 KV at n_seq=4 gives 10.3749/16.4962 on vs 10.3768/16.5101 off (different column
+bounds, same mask semantics). `GGML_CUDA_FATTN_TILE_GQA` and the other tile switches are
+unaffected.
 
 ## Milpster gfx906-llama-cpp Ports (2026-10-05, donor `HEAD` at `1373e889a`)
 
