@@ -120,7 +120,8 @@ endif()
 # Workaround is to mimic `-ffast-math` options with `-fno-math-errno -fno-rounding-math` enabled.
 # By default `-funsafe-math-optimizations` already enable: -fapprox-func, -fassociative-math, -freciprocal-math, -fno-signed-zeros, -fno-trapping-math, -ffp-contract=fast
 # `-ffinite-math-only` is false by default and not enable by `-funsafe-math-optimizations`
-set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -funsafe-math-optimizations -fno-associative-math -fno-math-errno -fno-rounding-math -fgpu-flush-denormals-to-zero -fsigned-zeros -fgpu-approx-transcendentals")
+# -fgpu-flush-denormals-to-zero disabled: causes memory scheduling issues on MMQ MXFP4
+set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -funsafe-math-optimizations -fno-associative-math -fno-math-errno -fno-rounding-math -fsigned-zeros -fgpu-approx-transcendentals")
 
 if (GGML_HIP_EXPORT_METRICS)
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Rpass-analysis=kernel-resource-usage --save-temps")
