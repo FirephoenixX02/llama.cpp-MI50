@@ -179,7 +179,7 @@ lines, i32 strides + plain mul-modulo).
 |------|-------|--------------|
 | `ggml/src/ggml-cuda/repack-gcn.cu` | +6610 (new) | Entire repacked matvec/MMQ + MoE + broadcast machinery + Q5_1/Q4_0/IQ repack + BF16-as-f16 upload; `lds_nc` column groups of 4 for NC 6..8 (`ffc7e39c1`). ~90% of fork delta. |
 | `ggml/src/ggml-cuda/repack-gcn.cuh` | +85 (new) | Public API for repack buffer type and `ggml_cuda_mul_mat_*_repacked`. |
-| `ggml/src/ggml-cuda/mmq-config-vega.cuh` | +282 (new) | Vega20 MMQ config table ported from RDNA2 with occupancy 1, `I=128` (`Q6_K I=64 occ2` after `2b620d7b9`), `launch_bounds 256,1` for 64KB LDS/W64 dp4a. +12 for Q2_0 fix (J_best=0). |
+| `ggml/src/ggml-cuda/mmq-config-gcn.cuh` | upstream +62 | Upstream GCN rows (occupancy 2, per-J `I`), plus a gfx906 block with bench-swept rows per type (`Q4_0 256/2/64`, `Q8_0 256/2/64`, `Q4_K 256/2/128`, `Q5_K 512/3/64`, `Q6_K 256/3/64`). Replaces `mmq-config-vega.cuh`, whose `256/1/128` rows were an unbenchmarked RDNA2 port. |
 | `ggml/src/ggml-cuda/ggml-cuda.cu` | +1177 | Repack buft hook + `mi50_force_link` + `FATTN`/`MMQ`/`REPACK` dispatch; `GFXPROF`, `set_device` fix (#21140), `Global` graph capture, HIP `kernel_funcs` graph guard (`2b620d7b9`); furnace ports: plain-FMA/skinny/register-blocked F32 GEMM, F32 row matvecs + multi-nc, transpose dispatch, shared-expert fusion + guards, GLU re-enable; MoE weighted-reduction walk bounds + zero-token alloc deps (`5a2255fcc`, ported from mx-llama.cpp); bf16 -> f16 relabel (`d2685bff2`). |
 | `ggml/src/ggml-cuda/common.cuh` | +143/-1 | DPP warp reductions (`GCN` only), `V_DOT2` gating, `MATRIX_ROW_PADDING`, `CC_GCN`/`VEGA20`, `W64`, `cuda_graph` `kernel_funcs` + `unstable_disabled` (`2b620d7b9`). |
 | `ggml/src/ggml-cuda/norm.cu` | +164 | `GCN` `RMSNorm` `float4` 4× `vec` (`tid*4`), `block_reduce` DPP, `rsqrtf` — `elementwise_v2.hip:62` port + `rms_norm_f32_gfx906_fused<256/1024>` `fused RMSNorm+MUL(+ADD)` `1` launch vs `2` (`2817c3c0d`). |
@@ -512,6 +512,11 @@ HIP/GCN-only. Four areas (detail: change-log row 21 + the commit body):
   replayed UB; the guard compares kernel-func sets and re-instantiates on change.
 - `mmq-config-vega.cuh` `Q6_K` retune `I=64 occ2` (+4.2% PP) and `mmq.cu`/`mmq.cuh` `J_max`/NVFP4
   `+128` tail padding (padding since superseded upstream).
+- Table merged into `mmq-config-gcn.cuh` (2026-11-27): the Vega-only rows are gone and the five
+  types carry bench-swept rows (see `bench/mmq/RESULTS.md`); `J > 64` keeps the generic GCN rows.
+  Non-repacked MMQ `q4_K` GEMM (n=512, m=4096, k=14336) 7431 -> 5137 us, ffn shape 5444 -> 3558 us;
+  model pp unchanged because prefill runs the repacked GEMM. Note `K_vram` must stay at
+  `MMQ_ITER_K`: larger values skip K work silently (checksum-proven).
 
 ## Furnace gfx906-perf Generic-Opt Ports (2026-10-01, donor `905021dba`; 2026-10-05, donor `fc353a5ac`)
 
